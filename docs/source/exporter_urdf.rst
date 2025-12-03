@@ -24,10 +24,14 @@ Here is an example of complete ``config.json`` file, with details below:
 
         // Package name (for ROS) (default: "")
         "package_name": "my_robot",
+        // Remove the package:// prefix from mesh URIs (default: true)
+        "use_package_uri_prefix": false,
         // Additional XML file to be included in the URDF (default: "")
         "additional_xml": "my_custom_file.xml",
         // Exclude inertial data for fixed bodies (default: false)
         "set_zero_mass_to_fixed": true,
+        // Order joints ascending by name (default: false)
+        "sort_joints_ascending": true,
 
         // Override joint properties (default: {})
         "joint_properties": {
@@ -100,6 +104,11 @@ All properties are added as nested XML elements within the ``<visual>`` or ``<co
 
 If you are exporting a URDF for ROS, you can specify the package name here. This will be used in the ``<robot>`` tag.
 
+``use_package_uri_prefix`` *(default: true)*
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Set this to ``false`` to omit the ``package://`` prefix when referencing mesh files. This is useful for consumers that expect plain relative filesystem paths instead of ROS package URIs.
+
 ``additional_xml`` *(default: "")*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -117,3 +126,8 @@ This option sets the mass to 0 for bodies that are :ref:`fixed <fixed-robot>` to
 .. note::
 
     In PyBullet, such bodies are indeed recognized as fixed
+
+``sort_joints_ascending`` *(default: false)*
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Sort the joints of each link alphabetically before they are emitted in the URDF. Enable this if you need a stable, name-ordered ``<joint>`` section for downstream tooling.

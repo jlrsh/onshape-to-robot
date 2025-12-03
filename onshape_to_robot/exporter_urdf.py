@@ -19,13 +19,16 @@ class ExporterURDF(Exporter):
         self.package_name: str = ""
         self.additional_xml: str = ""
         self.set_zero_mass_to_fixed: bool = False
+        self.use_package_uri_prefix: bool = True
+        self.sort_joints_ascending: bool = False
+        self._pending_joints: list[tuple[Joint, np.ndarray]] = []
 
         if config is not None:
             self.no_dynamics = config.no_dynamics
             self.package_name: str = config.get("package_name", "")
-            self.set_zero_mass_to_fixed: bool = config.get(
-                "set_zero_mass_to_fixed", False
-            )
+            self.set_zero_mass_to_fixed: bool = config.get("set_zero_mass_to_fixed", False)
+            self.use_package_uri_prefix = config.get("use_package_uri_prefix", True)
+            self.sort_joints_ascending = config.get("sort_joints_ascending", False)
             additional_xml_file = config.get("additional_xml", None, required=False)
             if isinstance(additional_xml_file, str):
                 self.add_additional_xml(additional_xml_file)
@@ -43,6 +46,7 @@ class ExporterURDF(Exporter):
 
     def build(self, robot: Robot):
         self.xml = ""
+        self._pending_joints = []
         self.append('<?xml version="1.0" ?>')
         self.append("<!-- Generated using onshape-to-robot -->")
         if self.config:
@@ -59,6 +63,8 @@ class ExporterURDF(Exporter):
 
         if len(robot.base_links) > 0:
             self.add_link(robot, robot.base_links[0])
+
+        self.flush_pending_joints()
 
         if self.additional_xml:
             self.append(self.additional_xml)
@@ -124,7 +130,10 @@ class ExporterURDF(Exporter):
             mesh_file = self.package_name + "/" + mesh_file
 
         self.append("<geometry>")
-        self.append(f'<mesh filename="package://{xml_escape(mesh_file)}" />')
+        mesh_filename = xml_escape(mesh_file)
+        if self.use_package_uri_prefix:
+            mesh_filename = f"package://{mesh_filename}"
+        self.append(f'<mesh filename="{mesh_filename}" />')
         self.append("</geometry>")
 
         if node == "visual":
@@ -311,9 +320,19 @@ class ExporterURDF(Exporter):
             self.add_frame(link, frame, T_world_link, T_world_frame)
 
         # Adding joints and children links
-        for joint in robot.get_link_joints(link):
+        joints = robot.get_link_joints(link)
+        for joint in joints:
             self.add_link(robot, joint.child, joint.T_world_joint)
-            self.add_joint(joint, T_world_link)
+            self._pending_joints.append((joint, T_world_link.copy()))
+
+    def flush_pending_joints(self):
+        if self.sort_joints_ascending:
+            pending = sorted(self._pending_joints, key=lambda entry: entry[0].name)
+        else:
+            pending = self._pending_joints
+
+        for joint, parent_transform in pending:
+            self.add_joint(joint, parent_transform)
 
     def origin(self, matrix: np.ndarray):
         """
