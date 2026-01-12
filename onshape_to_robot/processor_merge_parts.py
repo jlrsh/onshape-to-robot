@@ -4,7 +4,7 @@ from .config import Config
 from .robot import Robot, Link, Part
 from .processor import Processor
 from .geometry import Mesh
-from .message import bright, info, error
+from .message import bright, info, error, warning
 from stl import mesh, Mode
 
 
@@ -16,15 +16,53 @@ class ProcessorMergeParts(Processor):
     def __init__(self, config: Config):
         super().__init__(config)
         self.merge_stls = config.get("merge_stls", False)
+        self.collisions_as_visual = config.get("collisions_as_visual", False)
 
     def process(self, robot: Robot):
         if self.merge_stls:
-            os.makedirs(self.config.asset_path("merged"), exist_ok=True)
-            getcwd = os.getcwd()
-            os.chdir(self.config.output_directory)
+            merged_source_files = set()
             for link in robot.links:
-                self.merge_parts(link)
-            os.chdir(getcwd)
+                self.merge_parts(link, merged_source_files)
+            if self.merge_everything():
+                self.cleanup_merged_sources(robot, merged_source_files)
+
+    def merge_everything(self) -> bool:
+        return self.merge_stls != "collision" and self.merge_stls != "visual"
+
+    def cleanup_merged_sources(self, robot: Robot, merged_source_files: set[str]):
+        assets_root = os.path.abspath(self.config.asset_path(""))
+        remaining = self.collect_mesh_files(robot)
+        for filename in sorted(merged_source_files - remaining):
+            if not filename.lower().endswith(".stl"):
+                continue
+            abs_path = os.path.abspath(filename)
+            if os.path.commonpath([abs_path, assets_root]) != assets_root:
+                continue
+            try:
+                os.remove(abs_path)
+            except OSError as exc:
+                print(warning(f"WARNING: Failed to remove merged STL {abs_path}: {exc}"))
+
+            part_path = os.path.splitext(abs_path)[0] + ".part"
+            if os.path.commonpath([part_path, assets_root]) != assets_root:
+                continue
+            if os.path.exists(part_path):
+                try:
+                    os.remove(part_path)
+                except OSError as exc:
+                    print(
+                        warning(
+                            f"WARNING: Failed to remove merged part file {part_path}: {exc}"
+                        )
+                    )
+
+    def collect_mesh_files(self, robot: Robot) -> set[str]:
+        mesh_files = set()
+        for link in robot.links:
+            for part in link.parts:
+                for part_mesh in part.meshes:
+                    mesh_files.add(part_mesh.filename)
+        return mesh_files
 
     def load_mesh(self, stl_file: str) -> mesh.Mesh:
         return mesh.Mesh.from_file(stl_file)
@@ -54,12 +92,10 @@ class ProcessorMergeParts(Processor):
     def combine_meshes(self, m1: mesh.Mesh, m2: mesh.Mesh):
         return mesh.Mesh(np.concatenate([m1.data, m2.data]))
 
-    def merge_parts(self, link: Link):
+    def merge_parts(self, link: Link, merged_source_files: set[str]):
         print(info(f"+ Merging parts for {link.name}"))
 
-        merge_everything = (
-            self.merge_stls != "collision" and self.merge_stls != "visual"
-        )
+        merge_everything = self.merge_everything()
 
         # Computing the frame where the new part will be located at
         _, com, __ = link.get_dynamics()
@@ -69,13 +105,20 @@ class ProcessorMergeParts(Processor):
         # Computing a new color, weighting by masses
         color = np.zeros(4)
         total_mass = 0
+        mesh_colors = []
         for part in link.parts:
             if len(part.meshes):
                 meshes_color = np.mean([mesh.color for mesh in part.meshes], axis=0)
                 color += meshes_color * part.mass
+                mesh_colors.append(meshes_color)
             total_mass += part.mass
 
-        color /= total_mass
+        if total_mass > 0:
+            color /= total_mass
+        elif mesh_colors:
+            color = np.mean(mesh_colors, axis=0)
+        else:
+            color = np.array([0.5, 0.5, 0.5, 1.0])
 
         # Changing shapes frame
         merged_shapes = []
@@ -94,6 +137,7 @@ class ProcessorMergeParts(Processor):
             for part in link.parts:
                 for part_mesh in part.meshes:
                     if part_mesh.is_type(which):
+                        merged_source_files.add(part_mesh.filename)
                         if which == "visual":
                             part_mesh.visual = False
                         else:
@@ -114,12 +158,16 @@ class ProcessorMergeParts(Processor):
 
         merged_meshes = []
 
-        if self.merge_stls != "collision":
+        if self.merge_stls != "collision" and not self.collisions_as_visual:
             visual_mesh = accumulate_meshes("visual")
             if visual_mesh is not None:
-                filename = self.config.asset_path(
-                    "merged/" + "/" + link.name + "_visual.stl"
-                )
+                if merge_everything:
+                    filename = self.config.asset_path(f"{link.name}_visual.stl")
+                else:
+                    os.makedirs(self.config.asset_path("merged"), exist_ok=True)
+                    filename = self.config.asset_path(
+                        "merged/" + "/" + link.name + "_visual.stl"
+                    )
                 self.save_mesh(visual_mesh, filename)
                 merged_meshes.append(
                     Mesh(os.path.relpath(filename, self.config.output_directory), color, visual=True, collision=False)
@@ -128,12 +176,29 @@ class ProcessorMergeParts(Processor):
         if self.merge_stls != "visual":
             collision_mesh = accumulate_meshes("collision")
             if collision_mesh is not None:
-                filename = self.config.asset_path(
-                    "merged/" + "/" + link.name + "_collision.stl"
-                )
+                if merge_everything:
+                    if self.collisions_as_visual:
+                        filename = self.config.asset_path(f"{link.name}.stl")
+                    else:
+                        filename = self.config.asset_path(f"{link.name}_collision.stl")
+                else:
+                    os.makedirs(self.config.asset_path("merged"), exist_ok=True)
+                    if self.collisions_as_visual:
+                        filename = self.config.asset_path(
+                            "merged/" + "/" + link.name + ".stl"
+                        )
+                    else:
+                        filename = self.config.asset_path(
+                            "merged/" + "/" + link.name + "_collision.stl"
+                        )
                 self.save_mesh(collision_mesh, filename)
                 merged_meshes.append(
-                    Mesh(os.path.relpath(filename, self.config.output_directory), color, visual=False, collision=True)
+                    Mesh(
+                        filename,
+                        color,
+                        visual=self.collisions_as_visual,
+                        collision=True,
+                    )
                 )
 
         mass, com, inertia = link.get_dynamics(T_world_com)

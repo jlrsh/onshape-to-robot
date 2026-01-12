@@ -8,3 +8,4 @@ build
 onshape_to_robot.egg-info
 .env
 uv.lock
+*DS_Store

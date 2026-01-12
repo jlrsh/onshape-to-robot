@@ -30,3 +30,6 @@ This can be used for:
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 If set to ``true``, collision will be used as visual.
+
+When used with ``merge_stls: true``, only the merged collision mesh is kept, and its filename
+does not use the ``_collision`` suffix.
