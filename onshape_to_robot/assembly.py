@@ -894,10 +894,18 @@ class Assembly:
                                 )
                             )
                             print(parameter)
+                break  # Only process the first matching feature
         if enabled:
             if joint_type != Joint.BALL:
                 offset = self.get_offset(name)
                 if offset is not None:
+                    # For revolute joints, normalize the offset to (-π, π] so
+                    # that accumulated multi-revolution rotationZ values from
+                    # the Onshape API don't shift limits outside their intended
+                    # span.  The physical joint position repeats every 2π, so
+                    # only the principal angle matters.
+                    if joint_type == Joint.REVOLUTE:
+                        offset = np.arctan2(np.sin(offset), np.cos(offset))
                     minimum -= offset
                     maximum -= offset
             return (minimum, maximum)
