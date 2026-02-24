@@ -10,6 +10,16 @@ def xml_escape(unescaped: str) -> str:
     return escape(unescaped, entities={"'": "&apos;", '"': "&quot;"})
 
 
+# Cyclic axis permutation: Z out/Y up/X right -> X out/Z up/Y right
+# Maps: old X->new Y, old Y->new Z, old Z->new X
+T_x_forward = np.array([
+    [0, 1, 0, 0],
+    [0, 0, 1, 0],
+    [1, 0, 0, 0],
+    [0, 0, 0, 1]
+], dtype=float)
+
+
 def rotation_matrix_to_rpy(R):
     """
     Converts a rotation matrix to rpy Euler angles

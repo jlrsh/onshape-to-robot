@@ -133,6 +133,7 @@ class Config:
             raise Exception("You need to specify either a url or a document_id")
 
         self.draw_frames: bool = self.get("draw_frames", False)
+        self.frame_x_forward: bool = self.get("frame_x_forward", False)
 
         self.assembly_name: str = self.get("assembly_name", required=False)
         self.output_format: str = self.get("output_format")

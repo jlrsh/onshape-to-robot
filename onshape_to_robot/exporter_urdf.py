@@ -6,7 +6,7 @@ from .robot import Robot, Link, Part, Joint
 from .config import Config
 from .geometry import Box, Cylinder, Sphere, Shape, Mesh
 from .exporter import Exporter
-from .exporter_utils import xml_escape, rotation_matrix_to_rpy
+from .exporter_utils import xml_escape, rotation_matrix_to_rpy, T_x_forward
 
 
 class ExporterURDF(Exporter):
@@ -272,6 +272,8 @@ class ExporterURDF(Exporter):
         T_world_frame: np.ndarray,
     ):
         self.append(f"<!-- Frame {frame} (dummy link + fixed joint) -->")
+        if self.config and self.config.frame_x_forward and not frame.startswith("closing_"):
+            T_world_frame = T_world_frame @ T_x_forward
         T_link_frame = np.linalg.inv(T_world_link) @ T_world_frame
 
         # Adding a dummy link to the assembly

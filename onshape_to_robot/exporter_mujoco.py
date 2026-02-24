@@ -7,7 +7,7 @@ from .robot import Robot, Link, Part, Joint, Closure
 from .config import Config
 from .geometry import Box, Cylinder, Sphere, Mesh, Shape
 from .exporter import Exporter
-from .exporter_utils import xml_escape, rotation_matrix_to_rpy
+from .exporter_utils import xml_escape, rotation_matrix_to_rpy, T_x_forward
 from transforms3d.quaternions import mat2quat
 
 
@@ -330,6 +330,8 @@ class ExporterMuJoCo(Exporter):
         group: int = 0,
     ):
         self.append(f"<!-- Frame {frame} -->")
+        if self.config and self.config.frame_x_forward and not frame.startswith("closing_"):
+            T_world_frame = T_world_frame @ T_x_forward
         T_link_frame = np.linalg.inv(T_world_link) @ T_world_frame
 
         site: str = f'<site group="{group}" name="{frame}" '
