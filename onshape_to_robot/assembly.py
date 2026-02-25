@@ -558,9 +558,11 @@ class Assembly:
                 T_world_part = self.get_occurrence_transform(
                     mated_entity["matedOccurrence"]
                 )
+                T_part_mate = self.get_mate_transform(mated_entity)
+                T_world_mate = T_world_part @ T_part_mate
 
                 self.frames.append(
-                    Frame(self.instance_body[parent], name, T_world_part)
+                    Frame(self.instance_body[parent], name, T_world_mate)
                 )
 
                 if self.config.draw_frames:
@@ -633,15 +635,20 @@ class Assembly:
             if feature["featureType"] == "mateConnector" and feature["featureData"][
                 "name"
             ].startswith("link_"):
+                occurrence_id = feature["featureData"]["occurrence"][0]
+                if occurrence_id not in self.instance_body:
+                    continue
                 link_name = "_".join(feature["featureData"]["name"].split("_")[1:])
-                body_id = self.instance_body[feature["featureData"]["occurrence"][0]]
+                body_id = self.instance_body[occurrence_id]
                 self.link_names[body_id] = link_name
 
             if feature["featureType"] == "mateConnector" and feature["featureData"][
                 "name"
             ].startswith("frame_"):
-                name = "_".join(feature["featureData"]["name"].split("_")[1:])
                 occurrence = feature["featureData"]["occurrence"]
+                if occurrence[0] not in self.instance_body:
+                    continue
+                name = "_".join(feature["featureData"]["name"].split("_")[1:])
                 T_world_occurrence = self.get_occurrence_transform(occurrence)
                 body_id = self.instance_body[occurrence[0]]
                 T_occurrence_mate = self.cs_to_transformation(
