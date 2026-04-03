@@ -21,10 +21,13 @@ class ProcessorMergeParts(Processor):
     def process(self, robot: Robot):
         if self.merge_stls:
             merged_source_files = set()
+            getcwd = os.getcwd()
+            os.chdir(self.config.output_directory)
             for link in robot.links:
                 self.merge_parts(link, merged_source_files)
             if self.merge_everything():
                 self.cleanup_merged_sources(robot, merged_source_files)
+            os.chdir(getcwd)
 
     def merge_everything(self) -> bool:
         return self.merge_stls != "collision" and self.merge_stls != "visual"
@@ -194,7 +197,7 @@ class ProcessorMergeParts(Processor):
                 self.save_mesh(collision_mesh, filename)
                 merged_meshes.append(
                     Mesh(
-                        filename,
+                        os.path.relpath(filename, self.config.output_directory),
                         color,
                         visual=self.collisions_as_visual,
                         collision=True,

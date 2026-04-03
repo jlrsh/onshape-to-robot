@@ -14,7 +14,7 @@ class ProcessorSimplifySTLs(Processor):
         super().__init__(config)
 
         # STL merge / simplification
-        self.simplify_stls = config.get("simplify_stls", False)
+        self.simplify_stls = config.get("simplify_stls", True)
         self.max_stl_size = config.get("max_stl_size", 3)
 
         if self.simplify_stls:
