@@ -166,6 +166,15 @@ class Config:
             "include_configuration_suffix", True
         )
 
+        # Mesh transfer format from Onshape ("stl" or "glb")
+        self.mesh_format: str = self.get(
+            "mesh_format", "stl", values_list=["stl", "glb"]
+        )
+
+        # When using GLB, output to a separate URDF file so STL version is preserved
+        if self.mesh_format == "glb" and self.output_filename == "robot":
+            self.output_filename = "robot_glb"
+
         # Number of decimals to keep for small numbers
         self.round_decimals = self.get("round_decimals", 12)
 

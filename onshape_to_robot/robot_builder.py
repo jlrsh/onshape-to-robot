@@ -184,20 +184,26 @@ class RobotBuilder:
 
     def get_stl(self, instance: dict) -> str:
         """
-        Download and store STL file
+        Download and store mesh file. If mesh_format is "glb", fetches GLTF from
+        Onshape and saves as GLB (preserving colors, materials, normals).
+        Otherwise fetches binary STL.
         """
         os.makedirs(self.config.asset_path(""), exist_ok=True)
 
         stl_filename = self.get_stl_filename(instance)
-        filename = stl_filename + ".stl"
 
-        params = self.instance_request_params(instance)
-        stl = self.assembly.client.part_studio_stl_m(
-            **params,
-            partid=instance["partId"],
-        )
-        with open(self.config.asset_path(filename), "wb") as stream:
-            stream.write(stl)
+        if self.config.mesh_format == "glb":
+            filename = stl_filename + ".glb"
+            self._fetch_glb(instance, stl_filename, filename)
+        else:
+            filename = stl_filename + ".stl"
+            params = self.instance_request_params(instance)
+            stl = self.assembly.client.part_studio_stl_m(
+                **params,
+                partid=instance["partId"],
+            )
+            with open(self.config.asset_path(filename), "wb") as stream:
+                stream.write(stl)
 
         # Storing metadata for imported instances in the .part file
         stl_metadata = stl_filename + ".part"
@@ -207,6 +213,172 @@ class RobotBuilder:
             json.dump(instance, stream, indent=4, sort_keys=True)
 
         return self.config.asset_path(filename)
+
+    def _get_gltf_extract_dir(self, instance: dict) -> str:
+        """
+        Fetch and extract the GLTF ZIP for a Part Studio, caching per element.
+        The GLTF endpoint exports ALL parts in the Part Studio as separate .gltf
+        files in a ZIP archive, so we download once and reuse for all parts.
+        """
+        import io
+        import zipfile
+
+        # Cache key: (documentId, elementId) identifies a unique Part Studio
+        cache_key = (instance["documentId"], instance["elementId"])
+        if not hasattr(self, "_gltf_extract_dirs"):
+            self._gltf_extract_dirs = {}
+
+        if cache_key not in self._gltf_extract_dirs:
+            params = self.instance_request_params(instance)
+
+            # GLTF endpoint only supports workspace (w) or version (v), not microversion (m)
+            if params["wmv"] == "m":
+                if self.assembly.version_id:
+                    params["wmvid"] = self.assembly.version_id
+                    params["wmv"] = "v"
+                elif self.assembly.workspace_id:
+                    params["wmvid"] = self.assembly.workspace_id
+                    params["wmv"] = "w"
+
+            gltf_data = self.assembly.client.part_studio_gltf(
+                **params,
+                partid=instance["partId"],
+            )
+
+            # Extract ZIP to a persistent temp dir for this Part Studio
+            import tempfile
+
+            extract_dir = tempfile.mkdtemp(prefix="onshape_gltf_")
+            with zipfile.ZipFile(io.BytesIO(gltf_data)) as zf:
+                zf.extractall(extract_dir)
+
+            self._gltf_extract_dirs[cache_key] = extract_dir
+
+        return self._gltf_extract_dirs[cache_key]
+
+    def _fetch_glb(self, instance: dict, stl_filename: str, filename: str):
+        """
+        Fetch GLTF from Onshape and save as GLB, preserving colors, materials,
+        and normals. The GLTF endpoint returns a ZIP with all Part Studio parts
+        as separate .gltf files; we match by part name and convert to GLB.
+        """
+        try:
+            import trimesh
+        except ImportError:
+            print(error("ERROR: trimesh is required for GLB mesh format"))
+            print(info("TIP: pip install trimesh"))
+            raise
+
+        extract_dir = self._get_gltf_extract_dir(instance)
+
+        # Find the matching .gltf file by part name
+        # Instance names may have occurrence suffixes like " <1>" — strip them
+        import re
+
+        part_name = re.sub(r"\s*<\d+>\s*$", "", instance["name"])
+        gltf_files = [
+            f
+            for f in os.listdir(extract_dir)
+            if f.endswith((".gltf", ".glb"))
+        ]
+
+        def normalize_name(s):
+            """Normalize for matching: keep only alphanumeric and underscore."""
+            return re.sub(r"[^a-z0-9_]", "", s.lower())
+
+        def gltf_part_name_from_file(gf):
+            base = os.path.splitext(gf)[0]
+            if " - " in base:
+                return base.rsplit(" - ", 1)[1]
+            return base
+
+        def strip_disambiguation(s):
+            """Strip Onshape's (1), (2) etc. disambiguation suffixes."""
+            return re.sub(r"\s*\(\d+\)\s*$", "", s)
+
+        # Collect ALL candidates whose base name matches (ignoring (1), (2) suffixes)
+        norm_part = normalize_name(part_name)
+        candidates = []
+        for gf in gltf_files:
+            gltf_name = gltf_part_name_from_file(gf)
+            # Match against the base name (strip disambiguation suffix)
+            if normalize_name(strip_disambiguation(gltf_name)) == norm_part:
+                candidates.append(gf)
+
+        if not candidates:
+            # Fallback: fuzzy match by checking if normalized part name is contained
+            for gf in gltf_files:
+                if norm_part in normalize_name(gf):
+                    candidates.append(gf)
+
+        if not candidates:
+            raise Exception(
+                f"No matching GLTF file for part '{part_name}' in archive. "
+                f"Available: {gltf_files}"
+            )
+
+        # Fetch the STL for this specific partId (always correct geometry)
+        params = self.instance_request_params(instance)
+        stl_data = self.assembly.client.part_studio_stl_m(
+            **params,
+            partid=instance["partId"],
+        )
+        stl_mesh = trimesh.load(
+            trimesh.util.wrap_as_stream(stl_data), file_type="stl", force="mesh"
+        )
+        stl_bounds = stl_mesh.bounds
+        stl_size = stl_bounds[1] - stl_bounds[0]
+
+        # If multiple candidates, disambiguate by comparing geometry bounds with STL
+        if len(candidates) == 1:
+            matched = candidates[0]
+        else:
+            best_match = None
+            best_score = float("inf")
+            for gf in candidates:
+                gltf_path = os.path.join(extract_dir, gf)
+                candidate_scene = trimesh.load(gltf_path)
+                if isinstance(candidate_scene, trimesh.Scene) and len(candidate_scene.geometry) > 0:
+                    cverts = np.concatenate([g.vertices for g in candidate_scene.geometry.values()])
+                elif hasattr(candidate_scene, "vertices") and len(candidate_scene.vertices) > 0:
+                    cverts = candidate_scene.vertices
+                else:
+                    continue
+                csize = cverts.max(axis=0) - cverts.min(axis=0)
+                score = np.linalg.norm(csize - stl_size)
+                if score < best_score:
+                    best_score = score
+                    best_match = gf
+            matched = best_match if best_match is not None else candidates[0]
+
+        gltf_path = os.path.join(extract_dir, matched)
+        scene = trimesh.load(gltf_path)
+
+        # Align GLTF bounding box to match STL coordinate origin
+        stl_bounds_min = stl_bounds[0]
+
+        if isinstance(scene, trimesh.Scene) and len(scene.geometry) > 0:
+            all_verts = np.concatenate(
+                [g.vertices for g in scene.geometry.values()]
+            )
+        else:
+            all_verts = scene.vertices
+        gltf_bounds_min = all_verts.min(axis=0)
+
+        offset = stl_bounds_min - gltf_bounds_min
+        if np.linalg.norm(offset) > 1e-3:
+            T_offset = np.eye(4)
+            T_offset[:3, 3] = offset
+            if isinstance(scene, trimesh.Scene):
+                for geom in scene.geometry.values():
+                    geom.apply_transform(T_offset)
+            else:
+                scene.apply_transform(T_offset)
+
+        # Export as single GLB file (binary glTF, self-contained)
+        glb_path = self.config.asset_path(filename)
+        scene.export(glb_path, file_type="glb")
+        print(info(f"+ Saved {stl_filename}.glb (from {matched})"))
 
     def get_color(self, instance: dict) -> np.ndarray:
         """

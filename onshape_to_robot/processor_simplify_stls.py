@@ -48,16 +48,18 @@ class ProcessorSimplifySTLs(Processor):
                             simplify_all or mesh.is_type(self.simplify_stls)
                         ) and mesh.filename not in simplified:
                             simplified.add(mesh.filename)
-                            self.simplify_stl(mesh.filename)
+                            self.simplify_mesh(mesh.filename)
             os.chdir(getcwd)
 
     def reduce_faces(self, filename: str, reduction: float = 0.9):
+        if filename.lower().endswith((".glb", ".gltf")):
+            self._reduce_faces_glb(filename, reduction)
+        else:
+            self._reduce_faces_stl(filename, reduction)
+
+    def _reduce_faces_stl(self, filename: str, reduction: float):
         mesh_set = self.pymeshlab.MeshSet()
-
-        # Add input mesh
         mesh_set.load_new_mesh(filename)
-
-        # Apply filter
         mesh_set.apply_filter(
             "meshing_decimation_quadric_edge_collapse",
             targetperc=reduction,
@@ -73,11 +75,73 @@ class ProcessorSimplifySTLs(Processor):
             autoclean=True,
             selected=False,
         )
-
-        # Save mesh
         mesh_set.save_current_mesh(filename)
 
-    def simplify_stl(self, filename: str):
+    def _reduce_faces_glb(self, filename: str, reduction: float):
+        """
+        Decimate a GLB file while preserving materials/colors.
+        Loads as a trimesh Scene, decimates each geometry with pymeshlab,
+        then reattaches the original visual data before saving.
+        """
+        import trimesh
+        import numpy as np
+
+        scene = trimesh.load(filename)
+
+        if isinstance(scene, trimesh.Trimesh):
+            # Single mesh, not a scene
+            original_visual = scene.visual
+            scene = self._decimate_mesh(scene, reduction)
+            scene.visual = original_visual
+            scene.export(filename, file_type="glb")
+            return
+
+        # Scene with potentially multiple geometries
+        for name in list(scene.geometry.keys()):
+            geom = scene.geometry[name]
+            original_visual = geom.visual
+            decimated = self._decimate_mesh(geom, reduction)
+            decimated.visual = original_visual
+            scene.geometry[name] = decimated
+
+        scene.export(filename, file_type="glb")
+
+    def _decimate_mesh(self, mesh, reduction: float):
+        """Decimate a trimesh.Trimesh using pymeshlab, return new Trimesh."""
+        import trimesh
+        import tempfile
+
+        # Write to a temp STL for pymeshlab (it can't save GLB)
+        with tempfile.NamedTemporaryFile(suffix=".stl", delete=False) as tmp:
+            tmp_path = tmp.name
+            mesh.export(tmp_path)
+
+        try:
+            mesh_set = self.pymeshlab.MeshSet()
+            mesh_set.load_new_mesh(tmp_path)
+            mesh_set.apply_filter(
+                "meshing_decimation_quadric_edge_collapse",
+                targetperc=reduction,
+                qualitythr=0.5,
+                preserveboundary=False,
+                boundaryweight=1,
+                preservenormal=True,
+                preservetopology=False,
+                optimalplacement=True,
+                planarquadric=True,
+                qualityweight=False,
+                planarweight=0.001,
+                autoclean=True,
+                selected=False,
+            )
+            m = mesh_set.current_mesh()
+            return trimesh.Trimesh(
+                vertices=m.vertex_matrix(), faces=m.face_matrix()
+            )
+        finally:
+            os.unlink(tmp_path)
+
+    def simplify_mesh(self, filename: str):
         size_M = os.path.getsize(filename) / (1024 * 1024)
 
         if size_M > self.max_stl_size:

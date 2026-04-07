@@ -48,6 +48,9 @@ class Client:
     def request_binary(self, url, **kwargs):
         return self._api.request("get", url, **kwargs).content
 
+    def request_binary_post(self, url, body={}, **kwargs):
+        return self._api.request("post", url, body=body, **kwargs).content
+
     @cache_response
     def get_document(self, did):
         """
@@ -167,6 +170,66 @@ class Client:
             f"/api/parts/d/{escape(did)}/{escape(wmv)}/{escape(wmvid)}/e/{escape(eid)}/partid/{escape(partid)}/stl",
             query=query,
             headers=req_headers,
+        )
+
+    @cache_response
+    def part_studio_gltf(
+        self,
+        did,
+        wmvid,
+        eid,
+        partid="",
+        wmv="m",
+        configuration="default",
+        linked_document_id=None,
+    ):
+        import time
+
+        # The GLTF endpoint only supports workspace (w) or version (v), not microversion (m)
+        if wmv == "m":
+            raise ValueError(
+                "GLTF export does not support microversions. Use workspace (w) or version (v)."
+            )
+
+        body = {
+            "partIds": [partid] if partid else [],
+            "storeInDocument": False,
+            "configuration": configuration,
+        }
+        if linked_document_id is not None:
+            body["linkDocumentId"] = linked_document_id
+
+        # Start async translation
+        translation = self._api.request(
+            "post",
+            f"/api/v11/partstudios/d/{escape(did)}/{escape(wmv)}/{escape(wmvid)}/e/{escape(eid)}/export/gltf",
+            body=body,
+        ).json()
+
+        translation_id = translation["id"]
+
+        # Poll for completion with exponential backoff
+        delay = 1.0
+        while True:
+            status = self._api.request(
+                "get",
+                f"/api/v11/translations/{escape(translation_id)}",
+            ).json()
+
+            if status["requestState"] == "DONE":
+                break
+            elif status["requestState"] == "FAILED":
+                raise Exception(
+                    f"GLTF translation failed: {status.get('failureReason', 'unknown')}"
+                )
+
+            time.sleep(delay)
+            delay = min(delay * 1.5, 10.0)
+
+        # Download the result
+        external_data_id = status["resultExternalDataIds"][0]
+        return self.request_binary(
+            f"/api/v11/documents/d/{escape(did)}/externaldata/{escape(external_data_id)}",
         )
 
     @cache_response

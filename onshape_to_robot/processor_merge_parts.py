@@ -1,11 +1,22 @@
 import numpy as np
 import os
+import shutil
 from .config import Config
 from .robot import Robot, Link, Part
 from .processor import Processor
 from .geometry import Mesh
 from .message import bright, info, error, warning
 from stl import mesh, Mode
+
+
+def _glb_material_key(geom) -> tuple:
+    """Extract a hashable key from a trimesh geometry's material for grouping."""
+    v = geom.visual
+    if hasattr(v, "material") and v.material and hasattr(v.material, "baseColorFactor"):
+        c = v.material.baseColorFactor
+        if c is not None:
+            return tuple(int(x) for x in c)
+    return ("default",)
 
 
 class ProcessorMergeParts(Processor):
@@ -17,6 +28,7 @@ class ProcessorMergeParts(Processor):
         super().__init__(config)
         self.merge_stls = config.get("merge_stls", False)
         self.collisions_as_visual = config.get("collisions_as_visual", False)
+        self.mesh_ext = ".glb" if config.get("mesh_format", "stl") == "glb" else ".stl"
 
     def process(self, robot: Robot):
         if self.merge_stls:
@@ -27,6 +39,10 @@ class ProcessorMergeParts(Processor):
                 self.merge_parts(link, merged_source_files)
             if self.merge_everything():
                 self.cleanup_merged_sources(robot, merged_source_files)
+                # Remove stale "merged" subdirectory from previous runs
+                merged_dir = self.config.asset_path("merged")
+                if os.path.isdir(merged_dir):
+                    shutil.rmtree(merged_dir)
             os.chdir(getcwd)
 
     def merge_everything(self) -> bool:
@@ -36,7 +52,7 @@ class ProcessorMergeParts(Processor):
         assets_root = os.path.abspath(self.config.asset_path(""))
         remaining = self.collect_mesh_files(robot)
         for filename in sorted(merged_source_files - remaining):
-            if not filename.lower().endswith(".stl"):
+            if not filename.lower().endswith((".stl", ".glb", ".gltf")):
                 continue
             abs_path = os.path.abspath(filename)
             if os.path.commonpath([abs_path, assets_root]) != assets_root:
@@ -67,32 +83,52 @@ class ProcessorMergeParts(Processor):
                     mesh_files.add(part_mesh.filename)
         return mesh_files
 
-    def load_mesh(self, stl_file: str) -> mesh.Mesh:
-        return mesh.Mesh.from_file(stl_file)
+    def _is_glb(self, filename: str) -> bool:
+        return filename.lower().endswith((".glb", ".gltf"))
 
-    def save_mesh(self, mesh: mesh.Mesh, stl_file: str):
+    def load_mesh(self, mesh_file: str):
+        if self._is_glb(mesh_file):
+            import trimesh
+
+            loaded = trimesh.load(mesh_file, force="mesh")
+            return loaded
+        return mesh.Mesh.from_file(mesh_file)
+
+    def save_mesh(self, mesh_data, mesh_file: str):
+        if self._is_glb(mesh_file):
+            mesh_data.export(mesh_file, file_type="glb")
+            return
         # Tweaking STL header to avoid timestamp
         # This ensures that same process will result in same STL file
         def get_header(name):
             header = "onshape-to-robot"
             return header[:80].ljust(80, " ")
 
-        mesh.get_header = get_header
-        mesh.save(stl_file, mode=Mode.BINARY)
+        mesh_data.get_header = get_header
+        mesh_data.save(mesh_file, mode=Mode.BINARY)
 
-    def transform_mesh(self, mesh: mesh.Mesh, matrix: np.ndarray):
+    def transform_mesh(self, mesh_data, matrix: np.ndarray):
+        if hasattr(mesh_data, "apply_transform"):
+            # trimesh object
+            mesh_data.apply_transform(matrix)
+            return
         rotation = matrix[:3, :3]
         translation = matrix[:3, 3]
 
         def transform(points):
             return (rotation @ points.T).T + translation
 
-        mesh.v0 = transform(mesh.v0)
-        mesh.v1 = transform(mesh.v1)
-        mesh.v2 = transform(mesh.v2)
-        mesh.normals = transform(mesh.normals)
+        mesh_data.v0 = transform(mesh_data.v0)
+        mesh_data.v1 = transform(mesh_data.v1)
+        mesh_data.v2 = transform(mesh_data.v2)
+        mesh_data.normals = transform(mesh_data.normals)
 
-    def combine_meshes(self, m1: mesh.Mesh, m2: mesh.Mesh):
+    def combine_meshes(self, m1, m2):
+        if hasattr(m1, "vertices"):
+            # trimesh objects
+            import trimesh
+
+            return trimesh.util.concatenate([m1, m2])
         return mesh.Mesh(np.concatenate([m1.data, m2.data]))
 
     def merge_parts(self, link: Link, merged_source_files: set[str]):
@@ -134,7 +170,7 @@ class ProcessorMergeParts(Processor):
                         shape.T_part_shape = np.linalg.inv(T_world_com) @ T_world_shape
                         merged_shapes.append(shape)
 
-        # Merging STL files
+        # Merging mesh files
         def accumulate_meshes(which: str):
             mesh = None
             for part in link.parts:
@@ -159,17 +195,70 @@ class ProcessorMergeParts(Processor):
                             mesh = self.combine_meshes(mesh, part_mesh)
             return mesh
 
+        def accumulate_meshes_glb(which: str):
+            """
+            For GLB: accumulate meshes grouped by material color.
+            Geometries sharing the same baseColorFactor are concatenated into
+            a single mesh, drastically reducing draw calls while preserving
+            per-material coloring.
+            """
+            import trimesh
+            from collections import defaultdict
+
+            # Group meshes by material color
+            color_groups = defaultdict(list)
+
+            for part in link.parts:
+                for part_mesh in part.meshes:
+                    if part_mesh.is_type(which):
+                        merged_source_files.add(part_mesh.filename)
+                        if which == "visual":
+                            part_mesh.visual = False
+                        else:
+                            part_mesh.collision = False
+
+                        loaded = trimesh.load(part_mesh.filename)
+                        T_com_part = np.linalg.inv(T_world_com) @ part.T_world_part
+
+                        if isinstance(loaded, trimesh.Scene):
+                            for geom in loaded.geometry.values():
+                                geom.apply_transform(T_com_part)
+                                key = _glb_material_key(geom)
+                                color_groups[key].append(geom)
+                        else:
+                            loaded.apply_transform(T_com_part)
+                            key = _glb_material_key(loaded)
+                            color_groups[key].append(loaded)
+
+            if not color_groups:
+                return None
+
+            # Build scene with one merged mesh per unique material
+            scene = trimesh.Scene()
+            for idx, (key, geoms) in enumerate(color_groups.items()):
+                combined = trimesh.util.concatenate(geoms)
+                # Reattach the material from the first geometry in the group
+                combined.visual = geoms[0].visual
+                scene.add_geometry(combined, geom_name=f"material_{idx}")
+
+            return scene
+
         merged_meshes = []
+        use_glb = self.mesh_ext == ".glb"
+
+        # For GLB visual meshes, use scene-based accumulation to preserve per-part materials.
+        # For collision and STL, use flat mesh accumulation (materials don't matter for physics).
+        accumulate_visual = accumulate_meshes_glb if use_glb else accumulate_meshes
 
         if self.merge_stls != "collision" and not self.collisions_as_visual:
-            visual_mesh = accumulate_meshes("visual")
+            visual_mesh = accumulate_visual("visual")
             if visual_mesh is not None:
                 if merge_everything:
-                    filename = self.config.asset_path(f"{link.name}_visual.stl")
+                    filename = self.config.asset_path(f"{link.name}_visual{self.mesh_ext}")
                 else:
                     os.makedirs(self.config.asset_path("merged"), exist_ok=True)
                     filename = self.config.asset_path(
-                        "merged/" + "/" + link.name + "_visual.stl"
+                        "merged/" + "/" + link.name + f"_visual{self.mesh_ext}"
                     )
                 self.save_mesh(visual_mesh, filename)
                 merged_meshes.append(
@@ -177,22 +266,24 @@ class ProcessorMergeParts(Processor):
                 )
 
         if self.merge_stls != "visual":
-            collision_mesh = accumulate_meshes("collision")
+            # For collision+visual (collisions_as_visual), use scene accumulation for GLB
+            accumulate_collision = accumulate_meshes_glb if (use_glb and self.collisions_as_visual) else accumulate_meshes
+            collision_mesh = accumulate_collision("collision")
             if collision_mesh is not None:
                 if merge_everything:
                     if self.collisions_as_visual:
-                        filename = self.config.asset_path(f"{link.name}.stl")
+                        filename = self.config.asset_path(f"{link.name}{self.mesh_ext}")
                     else:
-                        filename = self.config.asset_path(f"{link.name}_collision.stl")
+                        filename = self.config.asset_path(f"{link.name}_collision{self.mesh_ext}")
                 else:
                     os.makedirs(self.config.asset_path("merged"), exist_ok=True)
                     if self.collisions_as_visual:
                         filename = self.config.asset_path(
-                            "merged/" + "/" + link.name + ".stl"
+                            "merged/" + "/" + link.name + self.mesh_ext
                         )
                     else:
                         filename = self.config.asset_path(
-                            "merged/" + "/" + link.name + "_collision.stl"
+                            "merged/" + "/" + link.name + f"_collision{self.mesh_ext}"
                         )
                 self.save_mesh(collision_mesh, filename)
                 merged_meshes.append(
