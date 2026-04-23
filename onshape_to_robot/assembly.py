@@ -741,7 +741,8 @@ class Assembly:
                 data = feature["featureData"]
 
                 for occurrence in data["occurrences"]:
-                    group.append(occurrence["occurrence"][0])
+                    if occurrence["occurrence"]:
+                        group.append(occurrence["occurrence"][0])
             groups.append(group)
 
         return groups
