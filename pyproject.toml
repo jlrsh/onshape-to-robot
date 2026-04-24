@@ -24,8 +24,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://onshape-to-robot.readthedocs.io/"
+Homepage = "https://github.com/rhoban/onshape-to-robot/"
 Repository = "https://github.com/rhoban/onshape-to-robot/"
+Documentation = "https://github.com/rhoban/onshape-to-robot/tree/master/docs"
 
 [project.scripts]
 onshape-to-robot = "onshape_to_robot:export.main"
