@@ -93,7 +93,7 @@ class ProcessorSimplifySTLs(Processor):
             original_visual = scene.visual
             scene = self._decimate_mesh(scene, reduction)
             scene.visual = original_visual
-            scene.export(filename, file_type="glb")
+            scene.export(filename, file_type="glb", include_normals=True)
             return
 
         # Scene with potentially multiple geometries
@@ -104,7 +104,10 @@ class ProcessorSimplifySTLs(Processor):
             decimated.visual = original_visual
             scene.geometry[name] = decimated
 
-        scene.export(filename, file_type="glb")
+        # include_normals=True: force NORMAL attribute. Decimation via STL
+        # round-trip and pymeshlab drops the cached vertex_normals, which
+        # would otherwise cause trimesh to omit the NORMAL attribute.
+        scene.export(filename, file_type="glb", include_normals=True)
 
     def _decimate_mesh(self, mesh, reduction: float):
         """Decimate a trimesh.Trimesh using pymeshlab, return new Trimesh."""
