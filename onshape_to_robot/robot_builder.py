@@ -375,9 +375,12 @@ class RobotBuilder:
             else:
                 scene.apply_transform(T_offset)
 
-        # Export as single GLB file (binary glTF, self-contained)
+        # Export as single GLB file (binary glTF, self-contained).
+        # include_normals=True forces the NORMAL attribute; trimesh otherwise
+        # skips it unless vertex_normals is already cached on the mesh, which
+        # is not guaranteed after concatenate/transform round-trips.
         glb_path = self.config.asset_path(filename)
-        scene.export(glb_path, file_type="glb")
+        scene.export(glb_path, file_type="glb", include_normals=True)
         print(info(f"+ Saved {stl_filename}.glb (from {matched})"))
 
     def get_color(self, instance: dict) -> np.ndarray:
@@ -461,6 +464,9 @@ class RobotBuilder:
         instance = occurrence["instance"]
 
         if instance["suppressed"]:
+            return
+
+        if self.assembly.is_occurrence_hidden(occurrence["path"]):
             return
 
         if instance["partId"] == "":
