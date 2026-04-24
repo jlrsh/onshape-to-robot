@@ -362,6 +362,19 @@ class Assembly:
         """
         return self.occurrences[tuple(path)]
 
+    def is_occurrence_hidden(self, path: list) -> bool:
+        """
+        An occurrence is hidden if it — or any ancestor subassembly along its
+        path — is hidden in the assembly. Onshape only sets `hidden` on the
+        occurrence that was directly toggled, so nested parts do not inherit
+        the flag and must be checked by walking up the path.
+        """
+        for i in range(1, len(path) + 1):
+            ancestor = self.occurrences.get(tuple(path[:i]))
+            if ancestor is not None and ancestor.get("hidden"):
+                return True
+        return False
+
     def get_occurrence_transform(self, path: list) -> np.ndarray:
         """
         Retrieve occurrence transform from its path

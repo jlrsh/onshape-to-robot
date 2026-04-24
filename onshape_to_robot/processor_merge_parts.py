@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import os
 import shutil
@@ -36,6 +37,7 @@ class ProcessorMergeParts(Processor):
             getcwd = os.getcwd()
             os.chdir(self.config.output_directory)
             for link in robot.links:
+                self.write_link_manifest(link, merged_source_files)
                 self.merge_parts(link, merged_source_files)
             if self.merge_everything():
                 self.cleanup_merged_sources(robot, merged_source_files)
@@ -44,6 +46,32 @@ class ProcessorMergeParts(Processor):
                 if os.path.isdir(merged_dir):
                     shutil.rmtree(merged_dir)
             os.chdir(getcwd)
+
+    def write_link_manifest(self, link: Link, merged_source_files: set[str]):
+        """
+        Write a per-link manifest listing constituent part instances (with
+        documentMicroversion, partId, configuration) so that merged links
+        like rail/carriage remain diffable under version control even after
+        merge_stls_clean_up deletes the per-part .part files.
+        """
+        entries = []
+        for part in link.parts:
+            for part_mesh in part.meshes:
+                mesh_path = os.path.abspath(part_mesh.filename)
+                part_file = os.path.splitext(mesh_path)[0] + ".part"
+                if not os.path.exists(part_file):
+                    continue
+                try:
+                    with open(part_file, "r", encoding="utf-8") as f:
+                        entries.append(json.load(f))
+                except (OSError, json.JSONDecodeError):
+                    continue
+        if not entries:
+            return
+        manifest_path = self.config.asset_path(f"{link.name}.part")
+        os.makedirs(os.path.dirname(os.path.abspath(manifest_path)), exist_ok=True)
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(entries, f, indent=4, sort_keys=True)
 
     def merge_everything(self) -> bool:
         return self.merge_stls != "collision" and self.merge_stls != "visual"
@@ -96,7 +124,10 @@ class ProcessorMergeParts(Processor):
 
     def save_mesh(self, mesh_data, mesh_file: str):
         if self._is_glb(mesh_file):
-            mesh_data.export(mesh_file, file_type="glb")
+            # include_normals=True forces the NORMAL attribute; trimesh otherwise
+            # skips it unless vertex_normals is already in the mesh cache, which
+            # is not guaranteed after concatenate/transform round-trips.
+            mesh_data.export(mesh_file, file_type="glb", include_normals=True)
             return
         # Tweaking STL header to avoid timestamp
         # This ensures that same process will result in same STL file
