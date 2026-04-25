@@ -5,6 +5,7 @@ from .message import error, info, bright, success, warning
 from .onshape_api.client import Client
 from .robot import Joint
 from .expression import ExpressionParser
+from .math_utils import normalize_angle_pi
 
 INSTANCE_IGNORE = -1
 
@@ -648,20 +649,37 @@ class Assembly:
             if feature["featureType"] == "mateConnector" and feature["featureData"][
                 "name"
             ].startswith("link_"):
+                feature_name = feature["featureData"]["name"]
                 occurrence_id = feature["featureData"]["occurrence"][0]
+                # Orphan mate connector: its occurrence was filtered out (e.g.
+                # hidden or ignored). Skip silently but warn so the user knows
+                # a named link was dropped.
                 if occurrence_id not in self.instance_body:
+                    print(
+                        warning(
+                            f"WARNING: link mate connector '{feature_name}' points at "
+                            f"occurrence {occurrence_id} which is not in the body map; skipping."
+                        )
+                    )
                     continue
-                link_name = "_".join(feature["featureData"]["name"].split("_")[1:])
+                link_name = "_".join(feature_name.split("_")[1:])
                 body_id = self.instance_body[occurrence_id]
                 self.link_names[body_id] = link_name
 
             if feature["featureType"] == "mateConnector" and feature["featureData"][
                 "name"
             ].startswith("frame_"):
+                feature_name = feature["featureData"]["name"]
                 occurrence = feature["featureData"]["occurrence"]
                 if occurrence[0] not in self.instance_body:
+                    print(
+                        warning(
+                            f"WARNING: frame mate connector '{feature_name}' points at "
+                            f"occurrence {occurrence[0]} which is not in the body map; skipping."
+                        )
+                    )
                     continue
-                name = "_".join(feature["featureData"]["name"].split("_")[1:])
+                name = "_".join(feature_name.split("_")[1:])
                 T_world_occurrence = self.get_occurrence_transform(occurrence)
                 body_id = self.instance_body[occurrence[0]]
                 T_occurrence_mate = self.cs_to_transformation(
@@ -915,18 +933,19 @@ class Assembly:
                                 )
                             )
                             print(parameter)
-                break  # Only process the first matching feature
+                # Joint names are unique, so the first feature whose name matches
+                # owns the limits; stop searching to avoid overwriting from a
+                # stale duplicate feature entry.
+                break
         if enabled:
             if joint_type != Joint.BALL:
                 offset = self.get_offset(name)
                 if offset is not None:
-                    # For revolute joints, normalize the offset to (-π, π] so
-                    # that accumulated multi-revolution rotationZ values from
-                    # the Onshape API don't shift limits outside their intended
-                    # span.  The physical joint position repeats every 2π, so
-                    # only the principal angle matters.
+                    # Revolute offsets come from accumulated rotationZ values and
+                    # may span multiple revolutions; the physical joint repeats
+                    # every 2π, so only the principal angle is meaningful.
                     if joint_type == Joint.REVOLUTE:
-                        offset = np.arctan2(np.sin(offset), np.cos(offset))
+                        offset = normalize_angle_pi(offset)
                     minimum -= offset
                     maximum -= offset
             return (minimum, maximum)

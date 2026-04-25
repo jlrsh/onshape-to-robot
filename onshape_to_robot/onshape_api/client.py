@@ -5,8 +5,17 @@ client
 Convenience functions for working with the Onshape API
 """
 
+import time
+
 from .onshape import Onshape
 from .cache import cache_response
+
+API_VERSION = "v11"
+# Absolute and per-attempt bounds for async translation polling.
+TRANSLATION_POLL_TIMEOUT_S = 300.0
+TRANSLATION_POLL_INITIAL_DELAY_S = 1.0
+TRANSLATION_POLL_MAX_DELAY_S = 10.0
+TRANSLATION_POLL_BACKOFF = 1.5
 
 
 def escape(s):
@@ -48,8 +57,34 @@ class Client:
     def request_binary(self, url, **kwargs):
         return self._api.request("get", url, **kwargs).content
 
-    def request_binary_post(self, url, body={}, **kwargs):
-        return self._api.request("post", url, body=body, **kwargs).content
+    def _poll_translation(self, translation_id, timeout_s=TRANSLATION_POLL_TIMEOUT_S):
+        """
+        Poll an async Onshape translation until it reaches a terminal state,
+        returning the DONE status payload. Raises on FAILED or timeout.
+        """
+        deadline = time.monotonic() + timeout_s
+        delay = TRANSLATION_POLL_INITIAL_DELAY_S
+        while True:
+            status = self._api.request(
+                "get",
+                f"/api/{API_VERSION}/translations/{escape(translation_id)}",
+            ).json()
+
+            state = status["requestState"]
+            if state == "DONE":
+                return status
+            if state == "FAILED":
+                raise Exception(
+                    f"GLTF translation failed: {status.get('failureReason', 'unknown')}"
+                )
+
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"GLTF translation {translation_id} did not complete within {timeout_s}s"
+                )
+
+            time.sleep(delay)
+            delay = min(delay * TRANSLATION_POLL_BACKOFF, TRANSLATION_POLL_MAX_DELAY_S)
 
     @cache_response
     def get_document(self, did):
@@ -183,8 +218,6 @@ class Client:
         configuration="default",
         linked_document_id=None,
     ):
-        import time
-
         # The GLTF endpoint only supports workspace (w) or version (v), not microversion (m)
         if wmv == "m":
             raise ValueError(
@@ -199,37 +232,17 @@ class Client:
         if linked_document_id is not None:
             body["linkDocumentId"] = linked_document_id
 
-        # Start async translation
         translation = self._api.request(
             "post",
-            f"/api/v11/partstudios/d/{escape(did)}/{escape(wmv)}/{escape(wmvid)}/e/{escape(eid)}/export/gltf",
+            f"/api/{API_VERSION}/partstudios/d/{escape(did)}/{escape(wmv)}/{escape(wmvid)}/e/{escape(eid)}/export/gltf",
             body=body,
         ).json()
 
-        translation_id = translation["id"]
+        status = self._poll_translation(translation["id"])
 
-        # Poll for completion with exponential backoff
-        delay = 1.0
-        while True:
-            status = self._api.request(
-                "get",
-                f"/api/v11/translations/{escape(translation_id)}",
-            ).json()
-
-            if status["requestState"] == "DONE":
-                break
-            elif status["requestState"] == "FAILED":
-                raise Exception(
-                    f"GLTF translation failed: {status.get('failureReason', 'unknown')}"
-                )
-
-            time.sleep(delay)
-            delay = min(delay * 1.5, 10.0)
-
-        # Download the result
         external_data_id = status["resultExternalDataIds"][0]
         return self.request_binary(
-            f"/api/v11/documents/d/{escape(did)}/externaldata/{escape(external_data_id)}",
+            f"/api/{API_VERSION}/documents/d/{escape(did)}/externaldata/{escape(external_data_id)}",
         )
 
     @cache_response

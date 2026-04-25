@@ -14,7 +14,7 @@ def main():
     else:
         fileName = sys.argv[1]
         robotDir = os.path.dirname(fileName)
-        configFile = os.path.join(robotDir, "config.json")
+        configFile = os.path.join(robotDir, "o2r.json")
         prefix = "PureShapes"
         if len(sys.argv) > 2:
             prefix = sys.argv[2]

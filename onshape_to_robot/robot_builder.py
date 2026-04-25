@@ -1,14 +1,18 @@
-import numpy as np
-import os
+import contextlib
+import fnmatch
 import hashlib
 import json
-import fnmatch
+import os
+
+import numpy as np
+
 from .geometry import Mesh
 from .message import warning, info, success, error, dim, bright
 from .assembly import Assembly
 from .config import Config
 from .robot import Part, Joint, Link, Robot, Relation, Closure
 from .csg import process as csg_process
+from .glb_io import export_glb
 
 
 class RobotBuilder:
@@ -22,10 +26,25 @@ class RobotBuilder:
 
         self.unique_names = {}
         self.stl_filenames: dict = {}
+        # One extracted GLTF archive per (documentId, elementId, configuration),
+        # lifetime-tied to close(). Temp-dir lifecycle for these archives is
+        # also managed by the ExitStack below.
+        self._gltf_extract_dirs: dict = {}
+        self._cleanup_stack = contextlib.ExitStack()
 
         for node in self.assembly.root_nodes:
             link = self.build_robot(node)
             self.robot.base_links.append(link)
+
+    def close(self) -> None:
+        """Release temp directories allocated during GLB extraction."""
+        self._cleanup_stack.close()
+
+    def __enter__(self) -> "RobotBuilder":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
 
     def part_is_ignored(self, name: str, what: str) -> bool:
         """
@@ -153,6 +172,22 @@ class RobotBuilder:
 
         return params
 
+    def glb_request_params(self, instance: dict) -> dict:
+        """
+        Same as `instance_request_params` but downgrades microversion (m) to
+        workspace (w) or version (v) because the GLTF export endpoint refuses
+        microversions.
+        """
+        params = self.instance_request_params(instance)
+        if params["wmv"] == "m":
+            if self.assembly.version_id:
+                params["wmvid"] = self.assembly.version_id
+                params["wmv"] = "v"
+            elif self.assembly.workspace_id:
+                params["wmvid"] = self.assembly.workspace_id
+                params["wmv"] = "w"
+        return params
+
     def get_stl_filename(self, instance: dict) -> str:
         """
         Get a STL filename unique to the instance
@@ -216,52 +251,47 @@ class RobotBuilder:
 
     def _get_gltf_extract_dir(self, instance: dict) -> str:
         """
-        Fetch and extract the GLTF ZIP for a Part Studio, caching per element.
-        The GLTF endpoint exports ALL parts in the Part Studio as separate .gltf
-        files in a ZIP archive, so we download once and reuse for all parts.
+        Fetch the whole part studio's GLTF archive from Onshape and extract it
+        to a temp directory, caching one extract per (documentId, elementId).
+        Onshape's GLTF export endpoint does not honor a per-part filter in
+        practice — requesting a partid still returns every part in the studio
+        — so downloading once per studio is strictly cheaper than per-part.
         """
         import io
+        import tempfile
         import zipfile
 
-        # Cache key: (documentId, elementId) identifies a unique Part Studio
-        cache_key = (instance["documentId"], instance["elementId"])
-        if not hasattr(self, "_gltf_extract_dirs"):
-            self._gltf_extract_dirs = {}
+        cache_key = (instance["documentId"], instance["elementId"], instance.get("configuration", ""))
+        if cache_key in self._gltf_extract_dirs:
+            return self._gltf_extract_dirs[cache_key]
 
-        if cache_key not in self._gltf_extract_dirs:
-            params = self.instance_request_params(instance)
+        params = self.glb_request_params(instance)
+        # partid="" asks for the entire studio (same payload Onshape returns
+        # even when a partid is supplied, but without the wasted cache churn).
+        gltf_data = self.assembly.client.part_studio_gltf(**params, partid="")
 
-            # GLTF endpoint only supports workspace (w) or version (v), not microversion (m)
-            if params["wmv"] == "m":
-                if self.assembly.version_id:
-                    params["wmvid"] = self.assembly.version_id
-                    params["wmv"] = "v"
-                elif self.assembly.workspace_id:
-                    params["wmvid"] = self.assembly.workspace_id
-                    params["wmv"] = "w"
+        extract_dir = self._cleanup_stack.enter_context(
+            tempfile.TemporaryDirectory(prefix="onshape_gltf_")
+        )
+        with zipfile.ZipFile(io.BytesIO(gltf_data)) as zf:
+            zf.extractall(extract_dir)
 
-            gltf_data = self.assembly.client.part_studio_gltf(
-                **params,
-                partid=instance["partId"],
-            )
-
-            # Extract ZIP to a persistent temp dir for this Part Studio
-            import tempfile
-
-            extract_dir = tempfile.mkdtemp(prefix="onshape_gltf_")
-            with zipfile.ZipFile(io.BytesIO(gltf_data)) as zf:
-                zf.extractall(extract_dir)
-
-            self._gltf_extract_dirs[cache_key] = extract_dir
-
-        return self._gltf_extract_dirs[cache_key]
+        self._gltf_extract_dirs[cache_key] = extract_dir
+        return extract_dir
 
     def _fetch_glb(self, instance: dict, stl_filename: str, filename: str):
         """
-        Fetch GLTF from Onshape and save as GLB, preserving colors, materials,
-        and normals. The GLTF endpoint returns a ZIP with all Part Studio parts
-        as separate .gltf files; we match by part name and convert to GLB.
+        Select the right .gltf entry (or entries) out of the cached part-studio
+        archive and write it as GLB. Onshape names each entry in the archive as
+        `"<studio-name> - <entity-name>.gltf"`. We match by the entity name
+        against the instance's part name; if multiple candidates remain (e.g.
+        pattern-feature duplicates), we fetch the per-part STL and disambiguate
+        by bounding-box size. If the part is split into surface entities whose
+        names don't mention the part at all, we fall back to the filenames that
+        share the studio-level prefix.
         """
+        import re
+
         try:
             import trimesh
         except ImportError:
@@ -270,117 +300,113 @@ class RobotBuilder:
             raise
 
         extract_dir = self._get_gltf_extract_dir(instance)
-
-        # Find the matching .gltf file by part name
-        # Instance names may have occurrence suffixes like " <1>" — strip them
-        import re
-
-        part_name = re.sub(r"\s*<\d+>\s*$", "", instance["name"])
         gltf_files = [
-            f
-            for f in os.listdir(extract_dir)
-            if f.endswith((".gltf", ".glb"))
+            f for f in os.listdir(extract_dir) if f.endswith((".gltf", ".glb"))
         ]
+        if not gltf_files:
+            raise Exception(
+                f"Onshape GLTF export for part '{instance.get('name')}' returned no gltf files"
+            )
 
-        def normalize_name(s):
-            """Normalize for matching: keep only alphanumeric and underscore."""
+        # Strip Onshape's assembly-occurrence suffix like " <2>".
+        part_name = re.sub(r"\s*<\d+>\s*$", "", instance["name"])
+
+        def _normalize(s: str) -> str:
             return re.sub(r"[^a-z0-9_]", "", s.lower())
 
-        def gltf_part_name_from_file(gf):
+        def _entity_name(gf: str) -> str:
             base = os.path.splitext(gf)[0]
-            if " - " in base:
-                return base.rsplit(" - ", 1)[1]
-            return base
+            return base.rsplit(" - ", 1)[-1] if " - " in base else base
 
-        def strip_disambiguation(s):
-            """Strip Onshape's (1), (2) etc. disambiguation suffixes."""
-            return re.sub(r"\s*\(\d+\)\s*$", "", s)
+        def _strip_disambig(name: str) -> str:
+            return re.sub(r"\s*\(\d+\)\s*$", "", name)
 
-        # Collect ALL candidates whose base name matches (ignoring (1), (2) suffixes)
-        norm_part = normalize_name(part_name)
-        candidates = []
-        for gf in gltf_files:
-            gltf_name = gltf_part_name_from_file(gf)
-            # Match against the base name (strip disambiguation suffix)
-            if normalize_name(strip_disambiguation(gltf_name)) == norm_part:
-                candidates.append(gf)
+        norm_part = _normalize(part_name)
 
+        # 1. Exact entity-name match (after stripping Onshape's " (N)" duplicate
+        #    suffix on pattern-feature entries).
+        candidates = [
+            gf for gf in gltf_files
+            if _normalize(_strip_disambig(_entity_name(gf))) == norm_part
+        ]
+
+        # 2. Studio-prefix / surface-split case: archive contains only surface
+        #    entries ("Surface N", "Part N", etc.) whose names don't mention the
+        #    part itself. Match by studio-level filename inclusion.
         if not candidates:
-            # Fallback: fuzzy match by checking if normalized part name is contained
-            for gf in gltf_files:
-                if norm_part in normalize_name(gf):
-                    candidates.append(gf)
+            candidates = [gf for gf in gltf_files if norm_part in _normalize(gf)]
 
         if not candidates:
             raise Exception(
-                f"No matching GLTF file for part '{part_name}' in archive. "
-                f"Available: {gltf_files}"
+                f"No GLTF entry matches part '{part_name}'. "
+                f"Available entries: {gltf_files}"
             )
 
-        # Fetch the STL for this specific partId (always correct geometry)
-        params = self.instance_request_params(instance)
-        stl_data = self.assembly.client.part_studio_stl_m(
-            **params,
-            partid=instance["partId"],
-        )
-        stl_mesh = trimesh.load(
-            trimesh.util.wrap_as_stream(stl_data), file_type="stl", force="mesh"
-        )
-        stl_bounds = stl_mesh.bounds
-        stl_size = stl_bounds[1] - stl_bounds[0]
-
-        # If multiple candidates, disambiguate by comparing geometry bounds with STL
+        # When exactly one candidate survives, we're done.
         if len(candidates) == 1:
             matched = candidates[0]
+            scenes = [trimesh.load(os.path.join(extract_dir, matched))]
         else:
-            best_match = None
-            best_score = float("inf")
-            for gf in candidates:
-                gltf_path = os.path.join(extract_dir, gf)
-                candidate_scene = trimesh.load(gltf_path)
-                if isinstance(candidate_scene, trimesh.Scene) and len(candidate_scene.geometry) > 0:
-                    cverts = np.concatenate([g.vertices for g in candidate_scene.geometry.values()])
-                elif hasattr(candidate_scene, "vertices") and len(candidate_scene.vertices) > 0:
-                    cverts = candidate_scene.vertices
-                else:
-                    continue
-                csize = cverts.max(axis=0) - cverts.min(axis=0)
-                score = np.linalg.norm(csize - stl_size)
-                if score < best_score:
-                    best_score = score
-                    best_match = gf
-            matched = best_match if best_match is not None else candidates[0]
+            # Multiple candidates — either pattern-feature duplicates that share
+            # a name, or surface-split entries that should be combined.
+            #
+            # Heuristic: if every candidate is a distinct logical entity (all
+            # have different normalized entity names), they're surface-split
+            # pieces of the same part and should be concatenated into one mesh.
+            # Otherwise (repeated entity names), disambiguate via STL bbox.
+            entity_names = {_normalize(_entity_name(gf)) for gf in candidates}
+            surface_split = len(entity_names) == len(candidates)
 
-        gltf_path = os.path.join(extract_dir, matched)
-        scene = trimesh.load(gltf_path)
-
-        # Align GLTF bounding box to match STL coordinate origin
-        stl_bounds_min = stl_bounds[0]
-
-        if isinstance(scene, trimesh.Scene) and len(scene.geometry) > 0:
-            all_verts = np.concatenate(
-                [g.vertices for g in scene.geometry.values()]
-            )
-        else:
-            all_verts = scene.vertices
-        gltf_bounds_min = all_verts.min(axis=0)
-
-        offset = stl_bounds_min - gltf_bounds_min
-        if np.linalg.norm(offset) > 1e-3:
-            T_offset = np.eye(4)
-            T_offset[:3, 3] = offset
-            if isinstance(scene, trimesh.Scene):
-                for geom in scene.geometry.values():
-                    geom.apply_transform(T_offset)
+            if surface_split:
+                scenes = [
+                    trimesh.load(os.path.join(extract_dir, gf))
+                    for gf in candidates
+                ]
+                matched = f"{len(candidates)} surface entries"
             else:
-                scene.apply_transform(T_offset)
+                # Disambiguate via per-part STL bbox.
+                stl_params = self.instance_request_params(instance)
+                stl_data = self.assembly.client.part_studio_stl_m(
+                    **stl_params, partid=instance["partId"]
+                )
+                stl_mesh = trimesh.load(
+                    trimesh.util.wrap_as_stream(stl_data),
+                    file_type="stl",
+                    force="mesh",
+                )
+                stl_size = stl_mesh.bounds[1] - stl_mesh.bounds[0]
 
-        # Export as single GLB file (binary glTF, self-contained).
-        # include_normals=True forces the NORMAL attribute; trimesh otherwise
-        # skips it unless vertex_normals is already cached on the mesh, which
-        # is not guaranteed after concatenate/transform round-trips.
+                best = candidates[0]
+                best_score = float("inf")
+                for gf in candidates:
+                    cand = trimesh.load(os.path.join(extract_dir, gf))
+                    if isinstance(cand, trimesh.Scene) and cand.geometry:
+                        verts = np.concatenate(
+                            [g.vertices for g in cand.geometry.values()]
+                        )
+                    elif hasattr(cand, "vertices") and len(cand.vertices):
+                        verts = cand.vertices
+                    else:
+                        continue
+                    size = verts.max(axis=0) - verts.min(axis=0)
+                    score = float(np.linalg.norm(size - stl_size))
+                    if score < best_score:
+                        best_score = score
+                        best = gf
+                matched = best
+                scenes = [trimesh.load(os.path.join(extract_dir, best))]
+
+        # Merge all selected scenes into a single output scene.
+        out = trimesh.Scene()
+        for loaded in scenes:
+            if isinstance(loaded, trimesh.Scene):
+                for name, geom in loaded.geometry.items():
+                    out.add_geometry(geom, geom_name=name)
+            elif hasattr(loaded, "vertices"):
+                out.add_geometry(loaded)
+
         glb_path = self.config.asset_path(filename)
-        scene.export(glb_path, file_type="glb", include_normals=True)
+        export_glb(out, glb_path)
         print(info(f"+ Saved {stl_filename}.glb (from {matched})"))
 
     def get_color(self, instance: dict) -> np.ndarray:

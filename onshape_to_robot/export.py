@@ -73,8 +73,10 @@ def main():
         else:
             raise Exception(f"Unsupported output format: {config.output_format}")
 
+        robot_builder = None
         if not args.convert:
-            # Building the robot
+            # Building the robot (context-managed so GLB extract temp dirs
+            # are reclaimed even if a later stage raises).
             robot_builder = RobotBuilder(config)
             robot = robot_builder.robot
 
@@ -111,6 +113,12 @@ def main():
     except Exception as e:
         print(error(f"ERROR: {e}"))
         raise e
+    finally:
+        try:
+            if robot_builder is not None:
+                robot_builder.close()
+        except (NameError, UnboundLocalError):
+            pass
 
 
 if __name__ == "__main__":

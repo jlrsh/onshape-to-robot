@@ -6,7 +6,7 @@ from .robot import Robot, Link, Part, Joint
 from .config import Config
 from .geometry import Box, Cylinder, Sphere, Shape, Mesh
 from .exporter import Exporter
-from .exporter_utils import xml_escape, rotation_matrix_to_rpy, T_x_forward
+from .exporter_utils import xml_escape, rotation_matrix_to_rpy, apply_frame_x_forward
 
 
 class ExporterURDF(Exporter):
@@ -21,7 +21,6 @@ class ExporterURDF(Exporter):
         self.set_zero_mass_to_fixed: bool = False
         self.use_package_uri_prefix: bool = True
         self.sort_joints_ascending: bool = False
-        self._pending_joints: list[tuple[Joint, np.ndarray]] = []
 
         if config is not None:
             self.no_dynamics = config.no_dynamics
@@ -46,7 +45,6 @@ class ExporterURDF(Exporter):
 
     def build(self, robot: Robot):
         self.xml = ""
-        self._pending_joints = []
         self.append('<?xml version="1.0" ?>')
         self.append("<!-- Generated using onshape-to-robot -->")
         if self.config:
@@ -61,10 +59,14 @@ class ExporterURDF(Exporter):
             )
             print(warning("Only the first base link will be considered."))
 
+        pending_joints: list[tuple[Joint, np.ndarray]] = []
         if len(robot.base_links) > 0:
-            self.add_link(robot, robot.base_links[0])
+            self.add_link(robot, robot.base_links[0], pending_joints=pending_joints)
 
-        self.flush_pending_joints()
+        if self.sort_joints_ascending:
+            pending_joints.sort(key=lambda entry: entry[0].name)
+        for joint, parent_transform in pending_joints:
+            self.add_joint(joint, parent_transform)
 
         if self.additional_xml:
             self.append(self.additional_xml)
@@ -272,8 +274,7 @@ class ExporterURDF(Exporter):
         T_world_frame: np.ndarray,
     ):
         self.append(f"<!-- Frame {frame} (dummy link + fixed joint) -->")
-        if self.config and self.config.frame_x_forward and not frame.startswith("closing_"):
-            T_world_frame = T_world_frame @ T_x_forward
+        T_world_frame = apply_frame_x_forward(T_world_frame, frame, self.config)
         T_link_frame = np.linalg.inv(T_world_link) @ T_world_frame
 
         # Adding a dummy link to the assembly
@@ -299,10 +300,21 @@ class ExporterURDF(Exporter):
         self.append('<axis xyz="0 0 0"/>')
         self.append("</joint>")
 
-    def add_link(self, robot: Robot, link: Link, T_world_link: np.ndarray = np.eye(4)):
+    def add_link(
+        self,
+        robot: Robot,
+        link: Link,
+        T_world_link: np.ndarray = np.eye(4),
+        pending_joints: list[tuple[Joint, np.ndarray]] | None = None,
+    ):
         """
-        Adds a link recursively to the URDF file
+        Adds a link recursively to the URDF file. Joints encountered during the
+        recursion are appended to `pending_joints` so the caller can emit them
+        in a stable (optionally sorted) order after the link tree is complete.
         """
+        if pending_joints is None:
+            pending_joints = []
+
         self.append(f"<!-- Link {link.name} -->")
         self.append(f'<link name="{link.name}">')
 
@@ -322,19 +334,9 @@ class ExporterURDF(Exporter):
             self.add_frame(link, frame, T_world_link, T_world_frame)
 
         # Adding joints and children links
-        joints = robot.get_link_joints(link)
-        for joint in joints:
-            self.add_link(robot, joint.child, joint.T_world_joint)
-            self._pending_joints.append((joint, T_world_link.copy()))
-
-    def flush_pending_joints(self):
-        if self.sort_joints_ascending:
-            pending = sorted(self._pending_joints, key=lambda entry: entry[0].name)
-        else:
-            pending = self._pending_joints
-
-        for joint, parent_transform in pending:
-            self.add_joint(joint, parent_transform)
+        for joint in robot.get_link_joints(link):
+            self.add_link(robot, joint.child, joint.T_world_joint, pending_joints)
+            pending_joints.append((joint, T_world_link.copy()))
 
     def origin(self, matrix: np.ndarray):
         """

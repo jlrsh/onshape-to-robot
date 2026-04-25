@@ -6,7 +6,7 @@ from .robot import Robot, Link, Part, Joint
 from .config import Config
 from .geometry import Box, Cylinder, Sphere, Mesh, Shape
 from .exporter import Exporter
-from .exporter_utils import xml_escape, rotation_matrix_to_rpy, T_x_forward
+from .exporter_utils import xml_escape, rotation_matrix_to_rpy, apply_frame_x_forward
 
 MODEL_CONFIG_XML = """
 <?xml version="1.0" ?>
@@ -267,8 +267,7 @@ class ExporterSDF(Exporter):
         T_world_frame: np.ndarray,
     ):
         self.append(f"<!-- Frame {frame} -->")
-        if self.config and self.config.frame_x_forward and not frame.startswith("closing_"):
-            T_world_frame = T_world_frame @ T_x_forward
+        T_world_frame = apply_frame_x_forward(T_world_frame, frame, self.config)
         T_link_frame = np.linalg.inv(T_world_link) @ T_world_frame
 
         self.append(f'<frame name="{frame}">')

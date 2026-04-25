@@ -7,7 +7,7 @@ from .robot import Robot, Link, Part
 from .processor import Processor
 from .geometry import Mesh
 from .message import bright, info, error, warning
-from stl import mesh, Mode
+from .mesh_adapter import mesh_adapter_for
 
 
 def _glb_material_key(geom) -> tuple:
@@ -29,7 +29,12 @@ class ProcessorMergeParts(Processor):
         super().__init__(config)
         self.merge_stls = config.get("merge_stls", False)
         self.collisions_as_visual = config.get("collisions_as_visual", False)
-        self.mesh_ext = ".glb" if config.get("mesh_format", "stl") == "glb" else ".stl"
+        self.mesh_format = config.get("mesh_format", "stl")
+        self.adapter = mesh_adapter_for(self.mesh_format)
+        self.mesh_ext = self.adapter.extension
+        # Cache once so path-traversal checks in cleanup_merged_sources don't
+        # recompute per file.
+        self._assets_root = os.path.abspath(self.config.asset_path(""))
 
     def process(self, robot: Robot):
         if self.merge_stls:
@@ -76,22 +81,27 @@ class ProcessorMergeParts(Processor):
     def merge_everything(self) -> bool:
         return self.merge_stls != "collision" and self.merge_stls != "visual"
 
+    def _inside_assets_root(self, abs_path: str) -> bool:
+        try:
+            return os.path.commonpath([abs_path, self._assets_root]) == self._assets_root
+        except ValueError:
+            return False
+
     def cleanup_merged_sources(self, robot: Robot, merged_source_files: set[str]):
-        assets_root = os.path.abspath(self.config.asset_path(""))
         remaining = self.collect_mesh_files(robot)
         for filename in sorted(merged_source_files - remaining):
             if not filename.lower().endswith((".stl", ".glb", ".gltf")):
                 continue
             abs_path = os.path.abspath(filename)
-            if os.path.commonpath([abs_path, assets_root]) != assets_root:
+            if not self._inside_assets_root(abs_path):
                 continue
             try:
                 os.remove(abs_path)
             except OSError as exc:
-                print(warning(f"WARNING: Failed to remove merged STL {abs_path}: {exc}"))
+                print(warning(f"WARNING: Failed to remove merged mesh {abs_path}: {exc}"))
 
             part_path = os.path.splitext(abs_path)[0] + ".part"
-            if os.path.commonpath([part_path, assets_root]) != assets_root:
+            if not self._inside_assets_root(part_path):
                 continue
             if os.path.exists(part_path):
                 try:
@@ -111,56 +121,17 @@ class ProcessorMergeParts(Processor):
                     mesh_files.add(part_mesh.filename)
         return mesh_files
 
-    def _is_glb(self, filename: str) -> bool:
-        return filename.lower().endswith((".glb", ".gltf"))
-
     def load_mesh(self, mesh_file: str):
-        if self._is_glb(mesh_file):
-            import trimesh
-
-            loaded = trimesh.load(mesh_file, force="mesh")
-            return loaded
-        return mesh.Mesh.from_file(mesh_file)
+        return self.adapter.load(mesh_file)
 
     def save_mesh(self, mesh_data, mesh_file: str):
-        if self._is_glb(mesh_file):
-            # include_normals=True forces the NORMAL attribute; trimesh otherwise
-            # skips it unless vertex_normals is already in the mesh cache, which
-            # is not guaranteed after concatenate/transform round-trips.
-            mesh_data.export(mesh_file, file_type="glb", include_normals=True)
-            return
-        # Tweaking STL header to avoid timestamp
-        # This ensures that same process will result in same STL file
-        def get_header(name):
-            header = "onshape-to-robot"
-            return header[:80].ljust(80, " ")
-
-        mesh_data.get_header = get_header
-        mesh_data.save(mesh_file, mode=Mode.BINARY)
+        self.adapter.save(mesh_data, mesh_file)
 
     def transform_mesh(self, mesh_data, matrix: np.ndarray):
-        if hasattr(mesh_data, "apply_transform"):
-            # trimesh object
-            mesh_data.apply_transform(matrix)
-            return
-        rotation = matrix[:3, :3]
-        translation = matrix[:3, 3]
-
-        def transform(points):
-            return (rotation @ points.T).T + translation
-
-        mesh_data.v0 = transform(mesh_data.v0)
-        mesh_data.v1 = transform(mesh_data.v1)
-        mesh_data.v2 = transform(mesh_data.v2)
-        mesh_data.normals = transform(mesh_data.normals)
+        self.adapter.transform(mesh_data, matrix)
 
     def combine_meshes(self, m1, m2):
-        if hasattr(m1, "vertices"):
-            # trimesh objects
-            import trimesh
-
-            return trimesh.util.concatenate([m1, m2])
-        return mesh.Mesh(np.concatenate([m1.data, m2.data]))
+        return self.adapter.combine(m1, m2)
 
     def merge_parts(self, link: Link, merged_source_files: set[str]):
         print(info(f"+ Merging parts for {link.name}"))
@@ -172,19 +143,22 @@ class ProcessorMergeParts(Processor):
         T_world_com = np.eye(4)
         T_world_com[:3, 3] = com
 
-        # Computing a new color, weighting by masses
+        # Computing a new color, weighting by masses. Only parts that contribute
+        # meshes are counted toward total_mass so empty parts don't dilute the
+        # resulting alpha/color.
         color = np.zeros(4)
-        total_mass = 0
+        weighted_mass = 0.0
         mesh_colors = []
         for part in link.parts:
-            if len(part.meshes):
-                meshes_color = np.mean([mesh.color for mesh in part.meshes], axis=0)
-                color += meshes_color * part.mass
-                mesh_colors.append(meshes_color)
-            total_mass += part.mass
+            if not len(part.meshes):
+                continue
+            meshes_color = np.mean([mesh.color for mesh in part.meshes], axis=0)
+            color += meshes_color * part.mass
+            mesh_colors.append(meshes_color)
+            weighted_mass += part.mass
 
-        if total_mass > 0:
-            color /= total_mass
+        if weighted_mass > 0:
+            color /= weighted_mass
         elif mesh_colors:
             color = np.mean(mesh_colors, axis=0)
         else:

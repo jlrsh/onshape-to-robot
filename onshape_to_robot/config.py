@@ -1,41 +1,144 @@
 from __future__ import annotations
+import copy
 import numpy as np
 import re
 import os
 import commentjson as json
+from functools import reduce
+
+from .message import info
+
+CONFIG_FILENAME = "o2r.json"
+
+
+def deep_merge(base: dict, overlay: dict) -> dict:
+    """
+    Deep-merge two config dicts. Overlay wins on conflict. Nested dicts recurse;
+    lists and scalars are replaced wholesale. Inputs are not mutated.
+    """
+    if not isinstance(base, dict) or not isinstance(overlay, dict):
+        return copy.deepcopy(overlay)
+
+    merged = copy.deepcopy(base)
+    for key, value in overlay.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _resolve_chain(config_path: str) -> list[str]:
+    """
+    Walk upward from config_path collecting o2r.json files in contiguous ancestor
+    directories. Returns the chain in oldest-first order (base ancestor first,
+    self last). Stops at the first ancestor directory without an o2r.json or at
+    the filesystem root.
+    """
+    chain: list[str] = [os.path.abspath(config_path)]
+    current_dir = os.path.dirname(os.path.abspath(config_path))
+
+    while True:
+        parent_dir = os.path.dirname(current_dir)
+        if parent_dir == current_dir:
+            break
+        parent_config = os.path.join(parent_dir, CONFIG_FILENAME)
+        if not os.path.exists(parent_config):
+            break
+        chain.insert(0, parent_config)
+        current_dir = parent_dir
+
+    return chain
+
+
+def _find_nearest_ancestor_config(start_dir: str) -> str | None:
+    """
+    Walk upward from start_dir looking for the first directory that contains an
+    o2r.json. Returns the config's absolute path, or None if the walk reaches
+    the filesystem root without finding one. Does not inspect `start_dir` itself.
+    """
+    current_dir = os.path.abspath(start_dir)
+    while True:
+        parent_dir = os.path.dirname(current_dir)
+        if parent_dir == current_dir:
+            return None
+        candidate = os.path.join(parent_dir, CONFIG_FILENAME)
+        if os.path.exists(candidate):
+            return candidate
+        current_dir = parent_dir
 
 
 class Config:
     def __init__(self, robot_path: str, safe: bool = False):
         self.safe: bool = safe
-        self.config_file: str = robot_path
 
+        abs_path = os.path.abspath(robot_path)
         if os.path.isdir(robot_path):
-            self.config_file += os.path.sep + "config.json"
+            target_dir = abs_path
+            direct_config = os.path.join(abs_path, CONFIG_FILENAME)
+        else:
+            target_dir = os.path.dirname(abs_path)
+            direct_config = abs_path
 
-        # Loading JSON configuration
-        if not os.path.exists(self.config_file):
-            raise Exception(f"ERROR: The file {self.config_file} can't be found")
-        with open(self.config_file, "r", encoding="utf8") as stream:
-            self.config: dict = json.load(stream)
+        # Output directory is pinned to the dir the CLI was pointed at — never
+        # to an ancestor that provides the actual config. All generated URDFs,
+        # pickles and assets land here.
+        self.output_directory: str = target_dir
 
-        # Loaded processors
+        variant_name: str | None = None
+        if os.path.exists(direct_config):
+            # CLI target has its own o2r.json: direct inheritance, contiguous
+            # ancestor chain, variants block (if present) is NOT applied.
+            self.config_file: str = direct_config
+            chain = _resolve_chain(direct_config)
+        else:
+            # No o2r.json at the CLI target: look for an ancestor that holds a
+            # `variants` block and apply the entry matching the target's
+            # basename. This lets a single centralized config drive many
+            # variant subdirectories.
+            ancestor = _find_nearest_ancestor_config(target_dir)
+            if ancestor is None:
+                raise Exception(
+                    f"No {CONFIG_FILENAME} at {direct_config} and no ancestor "
+                    f"directory holds one. Create an {CONFIG_FILENAME} at the "
+                    f"target or in a parent directory."
+                )
+            self.config_file = ancestor
+            chain = _resolve_chain(ancestor)
+            variant_name = os.path.basename(target_dir)
+
+        loaded = []
+        for path in chain:
+            with open(path, "r", encoding="utf8") as stream:
+                loaded.append(json.load(stream))
+        merged: dict = reduce(deep_merge, loaded, {})
+
+        # The `variants` key is loader-only metadata; it never reaches
+        # read_configuration. When the CLI target has no config of its own, the
+        # matching variant entry is deep-merged on top of the base config.
+        variants = merged.pop("variants", {}) or {}
+        if variant_name is not None:
+            if not isinstance(variants, dict) or variant_name not in variants:
+                known = sorted(variants.keys()) if isinstance(variants, dict) else []
+                raise Exception(
+                    f"No {CONFIG_FILENAME} at {direct_config}, and {self.config_file} "
+                    f"has no `variants.{variant_name}` entry. "
+                    f"Known variants: {known or 'none'}. "
+                    f"Add an {CONFIG_FILENAME} at the target or a "
+                    f"`variants.{variant_name}` block in the ancestor config."
+                )
+            merged = deep_merge(merged, variants[variant_name])
+
+        self.config: dict = merged
+        self.variant_name: str | None = variant_name
+
         self.processors: list = []
-
         self.read_configuration()
 
-        # Output directory, making it if it doesn't exists
-        self.output_directory: str = os.path.dirname(os.path.abspath(self.config_file))
-
         if self.robot_name is None:
-            self.robot_name = os.path.dirname(os.path.abspath(self.config_file)).split(
-                "/"
-            )[-1]
+            self.robot_name = os.path.basename(self.output_directory)
 
-        try:
-            os.makedirs(self.output_directory)
-        except OSError:
-            pass
+        os.makedirs(self.output_directory, exist_ok=True)
 
     def to_camel_case(self, snake_str: str) -> str:
         """
@@ -171,9 +274,11 @@ class Config:
             "mesh_format", "stl", values_list=["stl", "glb"]
         )
 
-        # When using GLB, output to a separate URDF file so STL version is preserved
+        # When using GLB, auto-rename the default "robot" output so a parallel
+        # STL run on the same directory doesn't clobber it.
         if self.mesh_format == "glb" and self.output_filename == "robot":
             self.output_filename = "robot_glb"
+            print(info(f"mesh_format=glb: output_filename -> {self.output_filename}"))
 
         # Number of decimals to keep for small numbers
         self.round_decimals = self.get("round_decimals", 12)

@@ -10,6 +10,11 @@ def xml_escape(unescaped: str) -> str:
     return escape(unescaped, entities={"'": "&apos;", '"': "&quot;"})
 
 
+# Frames whose name starts with this prefix are emitted as-is by the frame
+# rewriters — they represent kinematic-loop closing connections and must not be
+# reoriented by frame_x_forward.
+CLOSING_FRAME_PREFIX = "closing_"
+
 # Cyclic axis permutation: Z out/Y up/X right -> X out/Z up/Y right
 # Maps: old X->new Y, old Y->new Z, old Z->new X
 T_x_forward = np.array([
@@ -18,6 +23,22 @@ T_x_forward = np.array([
     [1, 0, 0, 0],
     [0, 0, 0, 1]
 ], dtype=float)
+
+
+def apply_frame_x_forward(T_world_frame: np.ndarray, frame_name: str, config) -> np.ndarray:
+    """
+    Return T_world_frame post-multiplied by T_x_forward when the config's
+    frame_x_forward flag is set, except for closing-loop frames (which carry
+    kinematic meaning and must not be reoriented). Otherwise returns the input
+    transform unchanged.
+    """
+    if (
+        config is not None
+        and getattr(config, "frame_x_forward", False)
+        and not frame_name.startswith(CLOSING_FRAME_PREFIX)
+    ):
+        return T_world_frame @ T_x_forward
+    return T_world_frame
 
 
 def rotation_matrix_to_rpy(R):
