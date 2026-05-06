@@ -206,12 +206,19 @@ class ProcessorMergeParts(Processor):
             Geometries sharing the same baseColorFactor are concatenated into
             a single mesh, drastically reducing draw calls while preserving
             per-material coloring.
+
+            Source part stems are tracked per material bucket and encoded in
+            the geom name as 'material_{idx}::{src1}+{src2}+...' so that
+            downstream logging can show which top-level parts contributed
+            to each material.
             """
             import trimesh
             from collections import defaultdict
 
-            # Group meshes by material color
+            # Group meshes by material color; track contributing part stems
+            # (ordered, deduped) so the merged geom_name can surface them.
             color_groups = defaultdict(list)
+            color_sources: dict = defaultdict(list)
 
             for part in link.parts:
                 for part_mesh in part.meshes:
@@ -222,6 +229,9 @@ class ProcessorMergeParts(Processor):
                         else:
                             part_mesh.collision = False
 
+                        src_stem = os.path.splitext(
+                            os.path.basename(part_mesh.filename)
+                        )[0]
                         loaded = trimesh.load(part_mesh.filename)
                         T_com_part = np.linalg.inv(T_world_com) @ part.T_world_part
 
@@ -230,10 +240,14 @@ class ProcessorMergeParts(Processor):
                                 geom.apply_transform(T_com_part)
                                 key = _glb_material_key(geom)
                                 color_groups[key].append(geom)
+                                if src_stem not in color_sources[key]:
+                                    color_sources[key].append(src_stem)
                         else:
                             loaded.apply_transform(T_com_part)
                             key = _glb_material_key(loaded)
                             color_groups[key].append(loaded)
+                            if src_stem not in color_sources[key]:
+                                color_sources[key].append(src_stem)
 
             if not color_groups:
                 return None
@@ -244,7 +258,12 @@ class ProcessorMergeParts(Processor):
                 combined = trimesh.util.concatenate(geoms)
                 # Reattach the material from the first geometry in the group
                 combined.visual = geoms[0].visual
-                scene.add_geometry(combined, geom_name=f"material_{idx}")
+                sources = color_sources.get(key, [])
+                if sources:
+                    geom_name = f"material_{idx}::" + "+".join(sources)
+                else:
+                    geom_name = f"material_{idx}"
+                scene.add_geometry(combined, geom_name=geom_name)
 
             return scene
 

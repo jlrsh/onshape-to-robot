@@ -2,6 +2,7 @@
 Single source of truth for GLB read/write. Importing trimesh is kept inside
 functions because it is only needed when mesh_format=glb is selected.
 """
+
 from __future__ import annotations
 
 import os
@@ -55,12 +56,11 @@ def _print_export_summary(scene_or_mesh: Any, path: str) -> None:
         print(f"  [export_glb] {name}: {size_mb:.2f} MB, empty scene")
         return
 
-    ranked = sorted(
-        geometries.items(), key=lambda kv: len(kv[1].faces), reverse=True
-    )
+    ranked = sorted(geometries.items(), key=lambda kv: len(kv[1].faces), reverse=True)
     total_faces = sum(len(g.faces) for _, g in ranked)
     top_line = ", ".join(
-        f"{gname}={_fmt_count(len(g.faces))}" for gname, g in ranked[:3]
+        f"{geom_display_name(gname)}={_fmt_count(len(g.faces))}"
+        for gname, g in ranked[:3]
     )
     print(
         f"  [export_glb] {name}: {size_mb:.2f} MB, {len(ranked)} geoms, "
@@ -76,10 +76,32 @@ def _print_export_summary(scene_or_mesh: Any, path: str) -> None:
     ):
         pct = 100.0 * heaviest_faces / total_faces
         print(
-            f"  [export_glb]   WARNING: '{heaviest_name}' is {heaviest_faces:,} "
-            f"faces ({pct:.0f}% of total) — consider reducing tessellation "
-            f"on that part in Onshape"
+            f"  [export_glb]   WARNING: {geom_display_name(heaviest_name)} "
+            f"is {heaviest_faces:,} faces ({pct:.0f}% of total) — consider "
+            f"reducing tessellation on that part in Onshape"
         )
+
+
+def geom_display_name(name: str, max_sources: int = 5) -> str:
+    """
+    Format a merged-scene geometry name for human-readable output.
+
+    Merge produces names like ``material_16::schunk_gehaeuse+dp31148_b_mount``;
+    this splits on ``::`` and renders as
+    ``material_16 [schunk_gehaeuse, dp31148_b_mount]``. If more than
+    ``max_sources`` source parts contributed, the remainder is summarized as
+    ``+N more``. Names without the ``::`` marker pass through unchanged.
+    """
+    if "::" not in name:
+        return name
+    prefix, rest = name.split("::", 1)
+    sources = [s for s in rest.split("+") if s]
+    if not sources:
+        return prefix
+    if len(sources) > max_sources:
+        shown = ", ".join(sources[:max_sources])
+        return f"{prefix} [{shown}, +{len(sources) - max_sources} more]"
+    return f"{prefix} [{', '.join(sources)}]"
 
 
 def _fmt_count(n: int) -> str:

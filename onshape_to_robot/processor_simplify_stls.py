@@ -3,7 +3,7 @@ from .config import Config
 from .robot import Robot
 from .processor import Processor
 from .message import bright, info, error
-from .glb_io import export_glb
+from .glb_io import export_glb, geom_display_name
 
 
 class ProcessorSimplifySTLs(Processor):
@@ -61,6 +61,17 @@ class ProcessorSimplifySTLs(Processor):
         # input tractable. Set to None/0 to disable.
         self.alpha_pre_decimate_faces = config.get(
             "alpha_pre_decimate_faces", 20000
+        )
+
+        # Per-geometry targeted simplification. When true, instead of
+        # decimating the whole merged GLB proportionally to hit max_stl_size,
+        # we walk each geometry and only simplify ones whose face count
+        # exceeds simplify_face_threshold. Clean own-CAD parts stay pristine;
+        # dense vendor parts get wrapped/decimated individually. Only applies
+        # to GLB output.
+        self.simplify_per_geometry = config.get("simplify_per_geometry", False)
+        self.simplify_face_threshold = config.get(
+            "simplify_face_threshold", 50000
         )
 
         if self.simplify_stls:
@@ -401,11 +412,123 @@ class ProcessorSimplifySTLs(Processor):
         wrapped.export(filename)
 
     # ------------------------------------------------------------------
+    # Per-geometry selective simplification
+    # ------------------------------------------------------------------
+
+    def _simplify_geometry(self, geom):
+        """
+        Simplify a single trimesh.Trimesh down to ~simplify_face_threshold
+        faces using the configured strategy. Returns a new Trimesh.
+        """
+        import trimesh
+
+        target_faces = self.simplify_face_threshold
+        if len(geom.faces) <= target_faces:
+            return geom
+
+        reduction = target_faces / len(geom.faces)
+
+        if self.simplify_strategy == "voxel":
+            out = self._voxel_remesh_mesh(geom)
+            if self.voxel_post_decimate and len(out.faces) > target_faces:
+                out = self._decimate_mesh(out, target_faces / len(out.faces))
+            return out
+
+        if self.simplify_strategy == "alpha":
+            out = self._alpha_wrap_mesh(geom)
+            if self.alpha_post_decimate and len(out.faces) > target_faces:
+                out = self._decimate_mesh(out, target_faces / len(out.faces))
+            return out
+
+        return self._decimate_mesh(geom, reduction)
+
+    def _simplify_per_geometry_glb(self, filename: str):
+        """
+        Load a GLB, simplify only the geometries whose face count exceeds
+        simplify_face_threshold, leave everything else untouched, save back.
+        """
+        import gc
+        import trimesh
+
+        scene = trimesh.load(filename)
+
+        if isinstance(scene, trimesh.Trimesh):
+            if len(scene.faces) <= self.simplify_face_threshold:
+                print(
+                    info(
+                        f"  single mesh {len(scene.faces)} faces — "
+                        f"under threshold, skipping"
+                    )
+                )
+                return
+            original_visual = scene.visual
+            simplified = self._simplify_geometry(scene)
+            simplified.visual = original_visual
+            export_glb(simplified, filename)
+            return
+
+        heavy = [
+            name
+            for name, g in scene.geometry.items()
+            if len(g.faces) > self.simplify_face_threshold
+        ]
+        heavy_display = (
+            ", ".join(geom_display_name(n) for n in heavy) if heavy else "(none)"
+        )
+        print(
+            info(
+                f"  {len(heavy)}/{len(scene.geometry)} geometries exceed "
+                f"threshold: {heavy_display}"
+            )
+        )
+
+        for name in heavy:
+            geom = scene.geometry[name]
+            original_visual = geom.visual
+            before = len(geom.faces)
+            simplified = self._simplify_geometry(geom)
+            simplified.visual = original_visual
+            scene.geometry[name] = simplified
+            print(
+                info(
+                    f"    {geom_display_name(name)}: "
+                    f"{before} -> {len(simplified.faces)} faces"
+                )
+            )
+            del geom, simplified
+            gc.collect()
+
+        export_glb(scene, filename)
+
+    # ------------------------------------------------------------------
 
     def simplify_mesh(self, filename: str):
         import time
 
         size_M = os.path.getsize(filename) / (1024 * 1024)
+
+        is_glb = filename.lower().endswith((".glb", ".gltf"))
+
+        # Per-geometry mode: decision is based on face counts, not file size,
+        # so it runs regardless of max_stl_size. Only makes sense for GLB.
+        if self.simplify_per_geometry and is_glb:
+            start = time.monotonic()
+            print(
+                info(
+                    f"+ {os.path.basename(filename)} running per-geometry "
+                    f"simplification ({self.simplify_strategy}, threshold="
+                    f"{self.simplify_face_threshold} faces)"
+                )
+            )
+            self._simplify_per_geometry_glb(filename)
+            elapsed = time.monotonic() - start
+            new_size_M = os.path.getsize(filename) / (1024 * 1024)
+            print(
+                info(
+                    f"  -> {new_size_M:.2f} M in {elapsed:.1f}s"
+                )
+            )
+            return
 
         if size_M <= self.max_stl_size:
             return
