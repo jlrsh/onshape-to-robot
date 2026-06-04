@@ -541,7 +541,7 @@ class Assembly:
                 self.merge_bodies(occurrence_A, occurrence_B)
 
         # Merging mate gorups
-        for group in self.feature_mate_groups():
+        for name, group in self.feature_mate_groups():
             for k in range(1, len(group)):
                 occurrence_A = group[0]
                 occurrence_B = group[k]
@@ -644,6 +644,23 @@ class Assembly:
                         ]
                     )
 
+        # Name links from mate groups named "link_...". Bodies are final at this
+        # point (all merges done), so the first occurrence resolves to the
+        # merged body. Explicit "link_" mate connectors below take precedence.
+        for name, group in self.feature_mate_groups():
+            if name.startswith("link_") and group:
+                occurrence_id = group[0]
+                if occurrence_id not in self.instance_body:
+                    print(
+                        warning(
+                            f"WARNING: link mate group '{name}' points at "
+                            f"occurrence {occurrence_id} which is not in the body map; skipping."
+                        )
+                    )
+                    continue
+                body_id = self.instance_body[occurrence_id]
+                self.link_names[body_id] = "_".join(name.split("_")[1:])
+
         # Search for mate connector named "link_..." to override link names
         for feature in self.assembly_data["rootAssembly"]["features"]:
             if feature["featureType"] == "mateConnector" and feature["featureData"][
@@ -702,6 +719,8 @@ class Assembly:
         print(success(f"* Found {len(self.root_nodes)} root nodes:"))
         for root_node in self.root_nodes:
             print(success(f"  - {self.body_instance(root_node)['name']}"))
+
+        self.log_bodies()
 
     def build_tree(self, root_node: int):
         """
@@ -762,19 +781,21 @@ class Assembly:
 
     def feature_mate_groups(self):
         """
-        Find mate groups in the assembly
+        Find mate groups in the assembly, returning (name, occurrences) for each
         """
         groups = []
 
         for feature in self.assembly_data["rootAssembly"]["features"]:
+            name = ""
             group = []
             if feature["featureType"] == "mateGroup" and not feature["suppressed"]:
                 data = feature["featureData"]
+                name = data["name"]
 
                 for occurrence in data["occurrences"]:
                     if occurrence["occurrence"]:
                         group.append(occurrence["occurrence"][0])
-            groups.append(group)
+            groups.append((name, group))
 
         return groups
 
@@ -977,6 +998,37 @@ class Assembly:
             key = occurrence["path"][0]
             if key in self.instance_body and self.instance_body[key] == body_id:
                 yield occurrence
+
+    def log_bodies(self):
+        """
+        Log the result of the assembly walker: which top-level instances were
+        grouped into each body (= link), plus the DOFs connecting them.
+        """
+        bodies: dict[int, list[str]] = {}
+        for instance in self.assembly_data["rootAssembly"]["instances"]:
+            body_id = self.instance_body.get(instance["id"])
+            if body_id is None or body_id == INSTANCE_IGNORE:
+                continue
+            bodies.setdefault(body_id, []).append(instance["name"])
+
+        print(bright(f"\n* Assembly walker: {len(bodies)} bodies (links)"))
+        for body_id in sorted(bodies):
+            link_name = self.link_names.get(body_id, "?")
+            roots = " [root]" if body_id in self.root_nodes else ""
+            print(info(f"  - body {body_id} (link '{link_name}'){roots}"))
+            for name in bodies[body_id]:
+                print(f"      · {name}")
+
+        if self.dofs:
+            print(bright("* DOFs:"))
+            for dof in self.dofs:
+                print(
+                    info(
+                        f"  - {dof.name} ({dof.joint_type}): "
+                        f"body {dof.body1_id} -> body {dof.body2_id}"
+                    )
+                )
+        print()
 
     def get_dof(self, body1_id: int, body2_id: int):
         """
