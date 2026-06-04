@@ -9,3 +9,8 @@ onshape_to_robot.egg-info
 .env
 uv.lock
 *DS_Store
+**.stl
+**.glb
+**.urdf
+**.part
+**/o2r.json
