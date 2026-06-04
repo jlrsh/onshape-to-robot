@@ -6,8 +6,9 @@ from .config import Config
 from .robot import Robot, Link, Part
 from .processor import Processor
 from .geometry import Mesh
-from .message import bright, info, error, warning
+from .message import bright, error, warning
 from .mesh_adapter import mesh_adapter_for
+from .glb_io import log_mesh_summary
 
 
 def _glb_material_key(geom) -> tuple:
@@ -134,8 +135,6 @@ class ProcessorMergeParts(Processor):
         return self.adapter.combine(m1, m2)
 
     def merge_parts(self, link: Link, merged_source_files: set[str]):
-        print(info(f"+ Merging parts for {link.name}"))
-
         merge_everything = self.merge_everything()
 
         # Computing the frame where the new part will be located at
@@ -285,6 +284,7 @@ class ProcessorMergeParts(Processor):
                         "merged/" + "/" + link.name + f"_visual{self.mesh_ext}"
                     )
                 self.save_mesh(visual_mesh, filename)
+                log_mesh_summary(visual_mesh, filename)
                 merged_meshes.append(
                     Mesh(os.path.relpath(filename, self.config.output_directory), color, visual=True, collision=False)
                 )
@@ -310,6 +310,7 @@ class ProcessorMergeParts(Processor):
                             "merged/" + "/" + link.name + f"_collision{self.mesh_ext}"
                         )
                 self.save_mesh(collision_mesh, filename)
+                log_mesh_summary(collision_mesh, filename)
                 merged_meshes.append(
                     Mesh(
                         os.path.relpath(filename, self.config.output_directory),

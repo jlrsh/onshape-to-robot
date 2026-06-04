@@ -403,6 +403,12 @@ class Assembly:
     def get_mate_transform(self, mated_entity: dict):
         return self.cs_to_transformation(mated_entity["matedCS"])
 
+    def slugify(self, value: str) -> str:
+        """
+        Turns a value into a slug
+        """
+        return "".join(c if c.isalnum() else "_" for c in value).strip("_")
+
     def make_body(self, id: str):
         """
         Make the given instance id a body
@@ -450,22 +456,36 @@ class Assembly:
         top_level_instances = self.assembly_data["rootAssembly"]["instances"]
         self.make_body(top_level_instances[0]["id"])
 
-        # We first search for DOFs
+        # We first search for DOFs and fixed joints. A "dof_" mate is an explicit
+        # joint; a plain FASTENED mate (not used for grouping/frames/loops) is
+        # treated as a fixed joint between two links rather than merging them.
         for data, occurrence_A, occurrence_B in self.feature_mating_two_occurrences():
-            if data["name"].startswith("dof_"):
-                # Process the DOF name, removing dof prefix and inv suffix
-                parts = data["name"].split("_")
-                del parts[0]
+            is_dof = data["name"].startswith("dof_")
+            is_fixed_joint = data["mateType"] == "FASTENED" and not (
+                is_dof
+                or data["name"].startswith("fix_")
+                or data["name"].startswith("closing_")
+                or data["name"].startswith("frame_")
+                or data["name"].startswith("link_")
+            )
+            if is_dof or is_fixed_joint:
                 data["inverted"] = False
-                if parts[-1] == "inv" or parts[-1] == "inverted":
-                    data["inverted"] = True
-                    del parts[-1]
-                name = "_".join(parts)
+                if is_dof:
+                    # Process the DOF name, removing dof prefix and inv suffix
+                    parts = data["name"].split("_")
+                    del parts[0]
+                    if parts[-1] == "inv" or parts[-1] == "inverted":
+                        data["inverted"] = True
+                        del parts[-1]
+                    name = "_".join(parts)
 
-                if name == "":
-                    raise Exception(
-                        f"ERROR: the following dof should have a name {data['name']}"
-                    )
+                    if name == "":
+                        raise Exception(
+                            f"ERROR: the following dof should have a name {data['name']}"
+                        )
+                else:
+                    # Plain FASTENED mate: name the fixed joint from the mate name
+                    name = self.slugify(data["name"])
 
                 # Finding joint type and limits
                 limits = None
@@ -505,11 +525,6 @@ class Assembly:
 
                 T_world_mate = T_world_part @ T_part_mate
 
-                limits_str = ""
-                if limits is not None:
-                    limits_str = f"[{round(limits[0], 3)}: {round(limits[1], 3)}]"
-                print(success(f"+ Found DOF: {name} ({joint_type}) {limits_str}"))
-
                 # Ensure occurrences are body
                 if occurrence_A not in self.instance_body:
                     self.make_body(occurrence_A)
@@ -530,14 +545,10 @@ class Assembly:
 
                 self.dofs.append(dof)
 
-        # Merging fixed links
+        # Merging fixed links. Only explicit "fix_" mates merge two parts into a
+        # single link; plain FASTENED mates now produce fixed joints (above).
         for data, occurrence_A, occurrence_B in self.feature_mating_two_occurrences():
-            if data["name"].startswith("fix_") or (
-                data["mateType"] == "FASTENED"
-                and not data["name"].startswith("dof_")
-                and not data["name"].startswith("closing_")
-                and not data["name"].startswith("frame_")
-            ):
+            if data["name"].startswith("fix_"):
                 self.merge_bodies(occurrence_A, occurrence_B)
 
         # Merging mate gorups
@@ -705,8 +716,6 @@ class Assembly:
                 T_world_mate = T_world_occurrence @ T_occurrence_mate
                 self.frames.append(Frame(body_id, name, T_world_mate))
 
-        print(success(f"* Found total {len(self.dofs)} degrees of freedom"))
-
     def build_trees(self):
         """
         Perform checks on the produced tree
@@ -715,10 +724,6 @@ class Assembly:
         for body_id in self.instance_body.values():
             if body_id != INSTANCE_IGNORE and body_id not in self.body_in_tree:
                 self.build_tree(body_id)
-
-        print(success(f"* Found {len(self.root_nodes)} root nodes:"))
-        for root_node in self.root_nodes:
-            print(success(f"  - {self.body_instance(root_node)['name']}"))
 
         self.log_bodies()
 

@@ -7,7 +7,7 @@ import os
 import numpy as np
 
 from .geometry import Mesh
-from .message import warning, info, success, error, dim, bright
+from .message import warning, info, error, bright
 from .assembly import Assembly
 from .config import Config
 from .robot import Part, Joint, Link, Robot, Relation, Closure
@@ -407,7 +407,6 @@ class RobotBuilder:
 
         glb_path = self.config.asset_path(filename)
         export_glb(out, glb_path)
-        print(info(f"+ Saved {stl_filename}.glb (from {matched})"))
 
     def get_color(self, instance: dict) -> np.ndarray:
         """
@@ -500,23 +499,6 @@ class RobotBuilder:
             return
 
         part_name = instance["name"]
-        extra = ""
-        if instance["configuration"] != "default":
-            extra = dim(
-                " (configuration: " + self.printable_configuration(instance) + ")"
-            )
-        symbol = "+"
-        if self.part_is_ignored(part_name, "visual") or self.part_is_ignored(
-            part_name, "collision"
-        ):
-            symbol = "-"
-            extra += dim(" / ")
-            if self.part_is_ignored(part_name, "visual"):
-                extra += dim("(ignoring visual)")
-            if self.part_is_ignored(part_name, "collision"):
-                extra += dim(" (ignoring collision)")
-
-        print(success(f"{symbol} Adding part {part_name}{extra}"))
 
         if self.part_is_ignored(part_name, "visual") and self.part_is_ignored(
             part_name, "collision"

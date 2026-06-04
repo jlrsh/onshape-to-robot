@@ -25,15 +25,14 @@ def export_glb(scene_or_mesh: Any, path: str) -> None:
     leads to flat shading in downstream viewers (e.g. rviz, MuJoCo).
     """
     scene_or_mesh.export(path, file_type="glb", include_normals=True)
-    _print_export_summary(scene_or_mesh, path)
 
 
-def _print_export_summary(scene_or_mesh: Any, path: str) -> None:
+def log_mesh_summary(scene_or_mesh: Any, path: str) -> None:
     """
-    Log a one-liner per exported GLB with size, face count, and — for scenes
-    — a breakdown of the heaviest geometries. Lets users spot which part of
-    an assembly is bloating the output before it becomes an OOM problem
-    downstream in simplification.
+    Log a one-liner for an output mesh with size, face count, and — for scenes
+    — a breakdown of the heaviest geometries. Called explicitly for final
+    output files (e.g. merged links) so per-part intermediate exports stay
+    quiet; lets users spot which part of an assembly is bloating the output.
     """
     import trimesh
 
@@ -46,14 +45,14 @@ def _print_export_summary(scene_or_mesh: Any, path: str) -> None:
 
     if isinstance(scene_or_mesh, trimesh.Trimesh):
         print(
-            f"  [export_glb] {name}: {size_mb:.2f} MB, "
+            f"+ {name}: {size_mb:.2f} MB, "
             f"{len(scene_or_mesh.faces):,} faces"
         )
         return
 
     geometries = getattr(scene_or_mesh, "geometry", {}) or {}
     if not geometries:
-        print(f"  [export_glb] {name}: {size_mb:.2f} MB, empty scene")
+        print(f"+ {name}: {size_mb:.2f} MB, empty scene")
         return
 
     ranked = sorted(geometries.items(), key=lambda kv: len(kv[1].faces), reverse=True)
@@ -63,7 +62,7 @@ def _print_export_summary(scene_or_mesh: Any, path: str) -> None:
         for gname, g in ranked[:3]
     )
     print(
-        f"  [export_glb] {name}: {size_mb:.2f} MB, {len(ranked)} geoms, "
+        f"+ {name}: {size_mb:.2f} MB, {len(ranked)} geoms, "
         f"{total_faces:,} faces; heaviest: {top_line}"
     )
 
@@ -76,7 +75,7 @@ def _print_export_summary(scene_or_mesh: Any, path: str) -> None:
     ):
         pct = 100.0 * heaviest_faces / total_faces
         print(
-            f"  [export_glb]   WARNING: {geom_display_name(heaviest_name)} "
+            f"    WARNING: {geom_display_name(heaviest_name)} "
             f"is {heaviest_faces:,} faces ({pct:.0f}% of total) — consider "
             f"reducing tessellation on that part in Onshape"
         )

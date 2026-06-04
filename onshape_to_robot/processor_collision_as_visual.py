@@ -1,5 +1,5 @@
 from pathlib import Path
-from .message import bright, info, error, warning
+from .message import bright, error, warning
 from .processor import Processor
 from .config import Config
 from .robot import Robot, Part
@@ -25,7 +25,6 @@ class ProcessorCollisionAsVisual(Processor):
         Runs the processor
         """
         if self.collisions_as_visual:
-            print(info("+ Converting collisions to visual"))
             for link in robot.links:
                 for part in link.parts:
                     for mesh in part.meshes:
